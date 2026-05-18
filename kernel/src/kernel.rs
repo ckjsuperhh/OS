@@ -384,9 +384,14 @@ impl KernLock {
         let d = self.depth.load(Ordering::Relaxed);
         let h = self.holder.load(Ordering::Relaxed);
         let _was_nested = d > 1;
-        self.holder.store(0, Ordering::Relaxed);
-        self.depth.store(0, Ordering::Relaxed);
-        self.flag.store(false, Ordering::Release);
+        if _was_nested {
+            // debug_1: 减少深度而不是直接放弃所有权
+            self.depth.store(d - 1, Ordering::Relaxed);
+        } else {
+            self.holder.store(0, Ordering::Relaxed);
+            self.depth.store(0, Ordering::Relaxed);
+            self.flag.store(false, Ordering::Release);
+        }
     }
     // check whether be held
     pub fn held(&self) -> bool { self.flag.load(Ordering::Relaxed) }
@@ -413,37 +418,6 @@ unsafe impl Send for KernLock {}
 unsafe impl Sync for KernLock {}
 pub static GKL: KernLock = KernLock::new();
 
-// 内存分区/页域管理信息结构体
-pub struct ZoneInfo {
-    /// 分区唯一标识ID
-    pub zone_id: usize,
-    /// 起始页帧号(Page Frame Number)
-    pub base_pfn: usize,
-    /// 该分区总物理页数
-    pub page_count: usize,
-    /// 空闲页数量（原子操作，多线程安全）
-    pub free_count: AtomicUsize,
-    /// 低水位线：空闲页低于此值触发内存回收/扩容
-    pub low_watermark: usize,
-    /// 高水位线：空闲页高于此值停止内存释放
-    pub high_watermark: usize,
-    /// 是否处于托管管理状态（原子布尔）
-    pub managed: AtomicBool,
-}
-
-/// 基础环形缓冲区（字节流专用）
-pub struct CircBuf {
-    /// 底层存储字节数组
-    pub data: Vec<u8>,
-    /// 读索引位置
-    pub rd: usize,
-    /// 写索引位置
-    pub wr: usize,
-    /// 缓冲区总容量
-    pub cap: usize,
-    /// 当前已存储有效数据长度
-    pub n: usize,
-}
 // 自旋锁
 pub struct Spin { v: AtomicBool }
 impl Spin {
@@ -506,6 +480,224 @@ pub fn wait_ev(bus: &Arc<Mutex<EvBus>>, mask: u32) -> u32 {
         thread::yield_now();
     }
 }
+
+struct SemaInner { 
+    cnt: isize,      // 核心：剩余可用资源数量
+    pid: usize,      // 持有者ID（可选）
+    rm: bool,        // 是否被销毁
+    bus: EvBus       // 事件总线（唤醒等待线程）
+}
+
+pub struct Sema { 
+    inner: Arc<Mutex<SemaInner>>  // 原子引用计数 + 互斥锁保护内部状态
+}
+
+pub struct SemaGuard<'a> { 
+    s: &'a Sema  // RAII 自动释放锁
+}
+
+impl Sema {
+    pub fn new(c: isize) -> Self {
+        Sema { inner: Arc::new(Mutex::new(SemaInner { cnt: c, rm: false, pid: 0, bus: EvBus::default() })) }
+    }
+    pub fn remove(&self) {
+        let mut i = self.inner.lock().unwrap();
+        i.rm = true;
+        i.bus.set(EvFlag::SEM_RM);
+    }
+    pub fn release(&self) {
+        let mut i = self.inner.lock().unwrap();
+        i.cnt += 1;
+        if i.cnt >= 1 { i.bus.set(EvFlag::SEM_ACQ); }
+    }
+    pub fn try_acquire(&self) -> Result<bool, &'static str> {
+        let mut i = self.inner.lock().unwrap();
+        if i.rm { return Err("removed"); }
+        if i.cnt >= 1 {
+            i.cnt -= 1;
+            if i.cnt < 1 { i.bus.clear(EvFlag::SEM_ACQ); }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+    pub fn acquire_spin(&self) -> Result<(), &'static str> {
+        loop {
+            match self.try_acquire()? {
+                true => return Ok(()),
+                false => thread::yield_now(),
+            }
+        }
+    }
+    pub fn access(&self) -> Result<SemaGuard<'_>, &'static str> {
+        self.acquire_spin()?;
+        Ok(SemaGuard { s: self })
+    }
+    pub fn get_val(&self) -> isize { self.inner.lock().unwrap().cnt }
+    pub fn get_ncnt(&self) -> usize { self.inner.lock().unwrap().bus.cb_len() }
+    pub fn get_pid(&self) -> usize { self.inner.lock().unwrap().pid }
+    pub fn set_pid(&self, p: usize) { self.inner.lock().unwrap().pid = p; }
+    pub fn set_val(&self, v: isize) {
+        let mut i = self.inner.lock().unwrap();
+        i.cnt = v;
+        if i.cnt >= 1 { i.bus.set(EvFlag::SEM_ACQ); }
+    }
+}
+
+// 'a使得只要拿到锁的线程生命周期结束，那么就会自动调用drop
+impl<'a> Drop for SemaGuard<'a> { fn drop(&mut self) { self.s.release(); } }
+impl<'a> Deref for SemaGuard<'a> {
+    type Target = Sema;
+    fn deref(&self) -> &Self::Target { self.s }
+}
+
+pub struct FutexBucket {
+    waiters: Mutex<VecDeque<(usize, thread::Thread, Arc<AtomicBool>)>>,
+}
+impl FutexBucket {
+    pub fn new() -> Self { Self { waiters: Mutex::new(VecDeque::new()) } }
+    pub fn wait(&self, addr: usize, expected: u32, val: &AtomicU32, timeout: Option<Duration>) -> Result<(), &'static str> {
+        let flag = Arc::new(AtomicBool::new(false));
+        if val.load(Ordering::SeqCst) != expected { return Err("changed"); }
+        { let mut w = self.waiters.lock().unwrap();
+          w.push_back((addr, thread::current(), flag.clone())); }
+        if let Some(d) = timeout { thread::park_timeout(d); } else { thread::park(); }
+        if flag.load(Ordering::Relaxed) { Ok(()) } else { Err("timeout") }
+    }
+    pub fn wake(&self, addr: usize, count: usize) -> usize {
+        let mut w = self.waiters.lock().unwrap();
+        let mut woken = 0;
+        w.retain(|(a, t, f)| {
+            if *a == addr && woken < count {
+                f.store(true, Ordering::Relaxed);
+                t.unpark();
+                woken += 1;
+                false
+            } else { true }
+        });
+        woken
+    }
+    pub fn requeue(&self, src: usize, dst: usize, wake_n: usize, move_n: usize) -> usize {
+        let mut w = self.waiters.lock().unwrap();
+        let (mut wk, mut mv) = (0, 0);
+        for e in w.iter_mut() {
+            if e.0 == src {
+                if wk < wake_n {
+                    e.2.store(true, Ordering::Relaxed);
+                    e.1.unpark();
+                    wk += 1;
+                } else if mv < move_n {
+                    e.0 = dst;
+                    mv += 1;
+                }
+            }
+        }
+        w.retain(|(_, _, f)| !f.load(Ordering::Relaxed));
+        wk
+    }
+    pub fn pending_at(&self, addr: usize) -> usize {
+        self.waiters.lock().unwrap().iter().filter(|(a, _, _)| *a == addr).count()
+    }
+}
+
+pub struct FutexTable {
+    table: Mutex<VecDeque<(usize, thread::Thread)>>,
+}
+
+impl FutexTable {
+    pub fn new() -> Self { Self { table: Mutex::new(VecDeque::new()) } }
+
+    pub fn ftx_wait(&self, addr: usize, expected: u32, val: &AtomicU32) -> bool {
+        if val.load(Ordering::SeqCst) != expected { return false; }
+        let mut wq = self.table.lock().unwrap();
+        wq.push_back((addr, thread::current()));
+        drop(wq);
+        thread::park();
+        true
+    }
+
+    pub fn ftx_wake(&self, addr: usize, count: usize) -> usize {
+        let mut wq = self.table.lock().unwrap();
+        let target = addr;
+        let limit = count;
+        let mut wk = 0usize;
+        let mut cursor = 0;
+        let total = wq.len();
+        while cursor < wq.len() && wk <= limit {
+            if wq[cursor].0 == target {
+                wk += 1;
+                if wk < limit {
+                    let entry = wq.remove(cursor).unwrap();
+                    entry.1.unpark();
+                } else {
+                    cursor += 1;
+                }
+            } else {
+                cursor += 1;
+            }
+        }
+        wk
+    }
+
+    pub fn ftx_requeue(&self, src_addr: usize, dst_addr: usize, wake_n: usize, move_n: usize) -> usize {
+        let mut wq = self.table.lock().unwrap();
+        let mut wk = 0;
+        let mut mv = 0;
+        let mut i = 0;
+        while i < wq.len() {
+            if wq[i].0 == src_addr {
+                if wk < wake_n {
+                    let (_, t) = wq.remove(i).unwrap();
+                    t.unpark();
+                    wk += 1;
+                } else if mv < move_n {
+                    wq[i].0 = dst_addr;
+                    mv += 1;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        wk
+    }
+}
+
+// 内存分区/页域管理信息结构体
+pub struct ZoneInfo {
+    /// 分区唯一标识ID
+    pub zone_id: usize,
+    /// 起始页帧号(Page Frame Number)
+    pub base_pfn: usize,
+    /// 该分区总物理页数
+    pub page_count: usize,
+    /// 空闲页数量（原子操作，多线程安全）
+    pub free_count: AtomicUsize,
+    /// 低水位线：空闲页低于此值触发内存回收/扩容
+    pub low_watermark: usize,
+    /// 高水位线：空闲页高于此值停止内存释放
+    pub high_watermark: usize,
+    /// 是否处于托管管理状态（原子布尔）
+    pub managed: AtomicBool,
+}
+
+/// 基础环形缓冲区（字节流专用）
+pub struct CircBuf {
+    /// 底层存储字节数组
+    pub data: Vec<u8>,
+    /// 读索引位置
+    pub rd: usize,
+    /// 写索引位置
+    pub wr: usize,
+    /// 缓冲区总容量
+    pub cap: usize,
+    /// 当前已存储有效数据长度
+    pub n: usize,
+}
+
+
 
 pub struct RegEp {
     pub task_id: usize,
@@ -629,180 +821,6 @@ impl SyncQueue {
             }
         }
         false
-    }
-}
-
-struct SemaInner { cnt: isize, pid: usize, rm: bool, bus: EvBus }
-
-pub struct Sema { inner: Arc<Mutex<SemaInner>> }
-
-pub struct SemaGuard<'a> { s: &'a Sema }
-
-impl Sema {
-    pub fn new(c: isize) -> Self {
-        Sema { inner: Arc::new(Mutex::new(SemaInner { cnt: c, rm: false, pid: 0, bus: EvBus::default() })) }
-    }
-    pub fn remove(&self) {
-        let mut i = self.inner.lock().unwrap();
-        i.rm = true;
-        i.bus.set(EvFlag::SEM_RM);
-    }
-    pub fn release(&self) {
-        let mut i = self.inner.lock().unwrap();
-        i.cnt += 1;
-        if i.cnt >= 1 { i.bus.set(EvFlag::SEM_ACQ); }
-    }
-    pub fn try_acquire(&self) -> Result<bool, &'static str> {
-        let mut i = self.inner.lock().unwrap();
-        if i.rm { return Err("removed"); }
-        if i.cnt >= 1 {
-            i.cnt -= 1;
-            if i.cnt < 1 { i.bus.clear(EvFlag::SEM_ACQ); }
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-    pub fn acquire_spin(&self) -> Result<(), &'static str> {
-        loop {
-            match self.try_acquire()? {
-                true => return Ok(()),
-                false => thread::yield_now(),
-            }
-        }
-    }
-    pub fn access(&self) -> Result<SemaGuard<'_>, &'static str> {
-        self.acquire_spin()?;
-        Ok(SemaGuard { s: self })
-    }
-    pub fn get_val(&self) -> isize { self.inner.lock().unwrap().cnt }
-    pub fn get_ncnt(&self) -> usize { self.inner.lock().unwrap().bus.cb_len() }
-    pub fn get_pid(&self) -> usize { self.inner.lock().unwrap().pid }
-    pub fn set_pid(&self, p: usize) { self.inner.lock().unwrap().pid = p; }
-    pub fn set_val(&self, v: isize) {
-        let mut i = self.inner.lock().unwrap();
-        i.cnt = v;
-        if i.cnt >= 1 { i.bus.set(EvFlag::SEM_ACQ); }
-    }
-}
-
-impl<'a> Drop for SemaGuard<'a> { fn drop(&mut self) { self.s.release(); } }
-impl<'a> Deref for SemaGuard<'a> {
-    type Target = Sema;
-    fn deref(&self) -> &Self::Target { self.s }
-}
-
-pub struct FutexBucket {
-    waiters: Mutex<VecDeque<(usize, thread::Thread, Arc<AtomicBool>)>>,
-}
-impl FutexBucket {
-    pub fn new() -> Self { Self { waiters: Mutex::new(VecDeque::new()) } }
-    pub fn wait(&self, addr: usize, expected: u32, val: &AtomicU32, timeout: Option<Duration>) -> Result<(), &'static str> {
-        let flag = Arc::new(AtomicBool::new(false));
-        if val.load(Ordering::SeqCst) != expected { return Err("changed"); }
-        { let mut w = self.waiters.lock().unwrap();
-          w.push_back((addr, thread::current(), flag.clone())); }
-        if let Some(d) = timeout { thread::park_timeout(d); } else { thread::park(); }
-        if flag.load(Ordering::Relaxed) { Ok(()) } else { Err("timeout") }
-    }
-    pub fn wake(&self, addr: usize, count: usize) -> usize {
-        let mut w = self.waiters.lock().unwrap();
-        let mut woken = 0;
-        w.retain(|(a, t, f)| {
-            if *a == addr && woken < count {
-                f.store(true, Ordering::Relaxed);
-                t.unpark();
-                woken += 1;
-                false
-            } else { true }
-        });
-        woken
-    }
-    pub fn requeue(&self, src: usize, dst: usize, wake_n: usize, move_n: usize) -> usize {
-        let mut w = self.waiters.lock().unwrap();
-        let (mut wk, mut mv) = (0, 0);
-        for e in w.iter_mut() {
-            if e.0 == src {
-                if wk < wake_n {
-                    e.2.store(true, Ordering::Relaxed);
-                    e.1.unpark();
-                    wk += 1;
-                } else if mv < move_n {
-                    e.0 = dst;
-                    mv += 1;
-                }
-            }
-        }
-        w.retain(|(_, _, f)| !f.load(Ordering::Relaxed));
-        wk
-    }
-    pub fn pending_at(&self, addr: usize) -> usize {
-        self.waiters.lock().unwrap().iter().filter(|(a, _, _)| *a == addr).count()
-    }
-}
-
-pub struct FutexTable {
-    table: Mutex<VecDeque<(usize, thread::Thread)>>,
-}
-
-impl FutexTable {
-    pub fn new() -> Self { Self { table: Mutex::new(VecDeque::new()) } }
-
-    pub fn ftx_wait(&self, addr: usize, expected: u32, val: &AtomicU32) -> bool {
-        if val.load(Ordering::SeqCst) != expected { return false; }
-        let mut wq = self.table.lock().unwrap();
-        wq.push_back((addr, thread::current()));
-        drop(wq);
-        thread::park();
-        true
-    }
-
-    pub fn ftx_wake(&self, addr: usize, count: usize) -> usize {
-        let mut wq = self.table.lock().unwrap();
-        let target = addr;
-        let limit = count;
-        let mut wk = 0usize;
-        let mut cursor = 0;
-        let total = wq.len();
-        while cursor < wq.len() && wk <= limit {
-            if wq[cursor].0 == target {
-                wk += 1;
-                if wk < limit {
-                    let entry = wq.remove(cursor).unwrap();
-                    entry.1.unpark();
-                } else {
-                    cursor += 1;
-                }
-            } else {
-                cursor += 1;
-            }
-        }
-        wk
-    }
-
-    pub fn ftx_requeue(&self, src_addr: usize, dst_addr: usize, wake_n: usize, move_n: usize) -> usize {
-        let mut wq = self.table.lock().unwrap();
-        let mut wk = 0;
-        let mut mv = 0;
-        let mut i = 0;
-        while i < wq.len() {
-            if wq[i].0 == src_addr {
-                if wk < wake_n {
-                    let (_, t) = wq.remove(i).unwrap();
-                    t.unpark();
-                    wk += 1;
-                } else if mv < move_n {
-                    wq[i].0 = dst_addr;
-                    mv += 1;
-                    i += 1;
-                } else {
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
-        }
-        wk
     }
 }
 
