@@ -1,7 +1,8 @@
 #![allow(unused, dead_code, non_upper_case_globals, non_camel_case_types, unused_assignments, unused_mut)]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque, HashMap, LinkedList};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+// 前几个是线程安全的数值类型，Ordering定义原子操作的内存可见性规则（控制多线程间数据同步的强度）
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering}; 
 use std::sync::{Arc, Mutex, RwLock, Weak, Condvar};
 use std::thread;
 use std::time::Duration;
@@ -10,206 +11,363 @@ use std::ops::{Deref, DerefMut, Index};
 use std::any::Any;
 use std::cmp::{min, max, Ordering as CmpOrd};
 
+/// 内存页标准大小 4KB
 pub const PAGE_SZ: usize = 4096;
+/// 系统最大支持进程数量
 pub const N_PROC: usize = 256;
+/// 系统可用物理页帧总数量
 pub const N_FRAMES: usize = 65536;
+/// 64位架构内核虚拟空间起始基地址
 pub const KERN_BASE: usize = 0xFFFF_FFFF_8000_0000;
+/// 物理内存线性映射虚拟地址偏移量
 pub const PHYS_OFF: usize = 0xFFFF_FFFF_0000_0000;
+/// 开发板物理内存起始偏移地址(RISC-V通用)
 pub const MEM_OFF: usize = 0x8000_0000;
+/// 内核动态堆内存总大小
 pub const KHEAP_SZ: usize = 0x800000;
+/// 哈希表/就绪队列链表分链数量
 pub const N_CHAINS: usize = 64;
+/// 内核环形缓冲区单缓冲区最大容量
 pub const RBUF_CAP: usize = 256;
+/// 进程上下文保存的通用寄存器个数
 pub const N_REGS: usize = 16;
+/// 文件系统最大嵌套挂载深度
 pub const MNT_DEPTH: usize = 8;
+/// 系统支持最大CPU核心数(多核调度用)
 pub const MAX_CPU: usize = 8;
+/// 单个内核栈空间大小
 pub const KSTK_SZ: usize = 0x4000;
+/// 用户进程栈在虚拟地址空间的起始偏移
 pub const USR_STK_OFF: usize = 0x7FFF_0000;
+/// 单个用户进程栈空间大小
 pub const USR_STK_SZ: usize = 0x10000;
+/// 系统时钟节拍单位：微秒，1节拍=1ms
 pub const USEC_TICK: usize = 1000;
+/// 符号链接/进程嵌套追踪最大递归层数
 pub const FOLLOW_LIM: usize = 3;
 
+// fcntl 命令：复制文件描述符（返回最小可用的 fd）
 pub const F_DUPFD: usize = 0;
+
+// fcntl 命令：获取文件描述符标志（主要获取 FD_CLOEXEC 标志）
 pub const F_GETFD: usize = 1;
+// fcntl 命令：设置文件描述符标志（主要设置 FD_CLOEXEC 标志）
 pub const F_SETFD: usize = 2;
+// fcntl 命令：获取文件状态标志（如 O_NONBLOCK / O_APPEND）
 pub const F_GETFL: usize = 3;
+// fcntl 命令：设置文件状态标志
 pub const F_SETFL: usize = 4;
+// fcntl 命令：获取文件锁信息
 pub const F_GETLK: usize = 5;
+// fcntl 命令：设置文件锁（非阻塞，获取不到立即返回）
 pub const F_SETLK: usize = 6;
+// fcntl 命令：设置文件锁（阻塞，获取不到会等待）
 pub const F_SETLKW: usize = 7;
+// 文件描述符标志：执行 exec 时自动关闭该 fd（close-on-exec）
 pub const FD_CLOEXEC: usize = 1;
+// fcntl 命令：复制文件描述符，并自动带上 FD_CLOEXEC 标志
 pub const F_DUPFD_CLOEXEC: usize = 1030;
+// 文件状态标志：非阻塞模式（read/write 不阻塞）
 pub const O_NONBLOCK: usize = 0o4000;
+// 文件状态标志：追加模式（写入时永远从文件末尾开始）
 pub const O_APPEND: usize = 0o2000;
+// 文件状态标志：打开文件时就设置 CLOEXEC（执行 exec 自动关闭）
 pub const O_CLOEXEC: usize = 0o2000000;
+// 打开目录/文件标志：不跟随符号链接（遇到软链接直接操作链接本身）
 pub const AT_NOFOLLOW: usize = 0x100;
 
+// 获取终端终端属性（termios 结构体）
 pub const TCGETS: usize = 0x5401;
+
+// 设置终端终端属性（termios 结构体）
 pub const TCSETS: usize = 0x5402;
+
+// 获取终端前台进程组 ID
 pub const TIOCGPGRP: usize = 0x540F;
+// 设置终端前台进程组 ID
 pub const TIOCSPGRP: usize = 0x5410;
+// 获取终端窗口大小（行、列）
 pub const TIOCGWINSZ: usize = 0x5413;
+// 清除文件描述符的 FD_CLOEXEC 标志
 pub const FIONCLEX: usize = 0x5450;
+// 设置文件描述符的 FD_CLOEXEC 标志
 pub const FIOCLEX: usize = 0x5451;
+// 设置文件描述符为非阻塞模式
 pub const FIONBIO: usize = 0x5421;
 
+/// 程序头表(Program Headers)在内存中的地址
 pub const AT_PHDR: u8 = 3;
+
+/// 程序头表中每个条目(Program Header Entry)的大小
 pub const AT_PHENT: u8 = 4;
+/// 程序头表的总条目数量
 pub const AT_PHNUM: u8 = 5;
+/// 系统内存页大小
 pub const AT_PAGESZ: u8 = 6;
+/// 程序解释器(动态链接器/ld.so)在内存中的基地址
 pub const AT_BASE: u8 = 7;
+/// 程序入口点地址（程序开始执行的地址）
 pub const AT_ENTRY: u8 = 9;
 
+// 启用信号字符：INTR/QUIT/SUSP 会产生信号
 pub const LM_ISIG: u32 = 0o000001;
+// 规范模式（行缓冲，等待回车才读取）
 pub const LM_ICANON: u32 = 0o000002;
+// 回显输入字符（输入什么显示什么）
 pub const LM_ECHO: u32 = 0o000010;
+// 回显擦除字符（退格时删除前一个字符）
 pub const LM_ECHOE: u32 = 0o000020;
+// 回显删除行字符（KILL 清空整行）
 pub const LM_ECHOK: u32 = 0o000040;
+// 回显换行符
 pub const LM_ECHONL: u32 = 0o000100;
+// 禁用中断/退出时的缓冲区刷新
 pub const LM_NOFLSH: u32 = 0o000200;
+// 后台进程写终端时发送 SIGTTOU 信号停止
 pub const LM_TOSTOP: u32 = 0o000400;
+// 启用扩展输入字符处理
 pub const LM_IEXTEN: u32 = 0o100000;
+// 规范模式下大写转小写（过时）
 pub const LM_XCASE: u32 = 0o000004;
+// 回显控制字符为 ^X 形式
 pub const LM_ECHOCTL: u32 = 0o001000;
+// 硬拷贝终端显示擦除（过时）
 pub const LM_ECHOPRT: u32 = 0o002000;
+// 按行删除时清空整行并回显
 pub const LM_ECHOKE: u32 = 0o004000;
+// 输出刷新挂起（过时）
 pub const LM_FLUSHO: u32 = 0o010000;
+// 重绘待输入的字符
 pub const LM_PENDIN: u32 = 0o040000;
+// 外部处理器处理终端（高级）
 pub const LM_EXTPROC: u32 = 0o200000;
 
-pub const VM_READ: u32 = 0x01;
-pub const VM_WRITE: u32 = 0x02;
-pub const VM_EXEC: u32 = 0x04;
-pub const VM_SHARED: u32 = 0x08;
-pub const VM_GROWSDOWN: u32 = 0x10;
-pub const VM_DONTCOPY: u32 = 0x20;
-pub const VM_HUGETLB: u32 = 0x40;
-pub const VM_PFNMAP: u32 = 0x80;
+pub const VM_READ: u32 = 0x01;        // 可读
+pub const VM_WRITE: u32 = 0x02;       // 可写
+pub const VM_EXEC: u32 = 0x04;        // 可执行
+pub const VM_SHARED: u32 = 0x08;      // 进程间共享
+pub const VM_GROWSDOWN: u32 = 0x10;   // 栈内存：向下增长
+pub const VM_DONTCOPY: u32 = 0x20;   // fork 时不拷贝该内存
+pub const VM_HUGETLB: u32 = 0x40;     // 使用大页内存
+pub const VM_PFNMAP: u32 = 0x80;     // 直接映射物理页帧(PFN)
 
+/// 修改文件所有者权限
 pub const CAP_CHOWN: u32 = 0;
+/// 向任意进程发送信号（kill/信号控制）
 pub const CAP_KILL: u32 = 5;
+/// 设置任意用户ID（UID）
 pub const CAP_SETUID: u32 = 7;
+/// 设置任意组ID（GID）
 pub const CAP_SETGID: u32 = 6;
+/// 绑定特权端口（<1024 的端口）
 pub const CAP_NET_BIND: u32 = 10;
+/// 使用原始套接字（抓包、构造IP包）
 pub const CAP_NET_RAW: u32 = 13;
+/// 系统管理全能权限（等同于部分 root 能力）
 pub const CAP_SYS_ADMIN: u32 = 21;
+/// 追踪任意进程（调试、ptrace）
 pub const CAP_SYS_PTRACE: u32 = 19;
+/// 可继承能力掩码（限制子进程能继承的权限范围）
 pub const INHERITABLE_MASK: u64 = 0x0000_00FF_FFFF_FFFF;
 
+// DMA 内存区域：用于直接内存访问，物理地址连续、低地址内存
 pub const ZONE_DMA: usize = 0;
+// 常规内存区域：内核可直接映射访问的标准物理内存
 pub const ZONE_NORMAL: usize = 1;
+// 高端内存区域：超过内核直接映射范围的高地址内存（如32位系统>896MB内存）
 pub const ZONE_HIGH: usize = 2;
+// 内存区域总数量：固定3种区域
 pub const N_ZONES: usize = 3;
 
-pub const PRIO_MIN: i32 = -20;
-pub const PRIO_MAX: i32 = 19;
-pub const PRIO_DEFAULT: i32 = 0;
-pub const SCHED_NORMAL: u8 = 0;
-pub const SCHED_FIFO: u8 = 1;
-pub const SCHED_RR: u8 = 2;
-pub const SCHED_BATCH: u8 = 3;
+// 进程静态优先级范围（Linux nice 值）
+pub const PRIO_MIN: i32 = -20;      // 最高优先级
+pub const PRIO_MAX: i32 = 19;       // 最低优先级
+pub const PRIO_DEFAULT: i32 = 0;    // 默认优先级
 
+// Linux 调度策略
+pub const SCHED_NORMAL: u8 = 0;     // 普通分时调度（CFS）
+pub const SCHED_FIFO: u8 = 1;       // 先进先出实时调度
+pub const SCHED_RR: u8 = 2;         // 轮询实时调度
+pub const SCHED_BATCH: u8 = 3;      // 批处理调度
+
+/// Slab 分配器最小对象大小（字节）
 pub const SLAB_OBJ_MIN: usize = 8;
+/// Slab 分配器最大对象大小（字节）
 pub const SLAB_OBJ_MAX: usize = 2048;
+/// Slab 对象内存对齐要求（字节）
 pub const SLAB_ALIGN: usize = 8;
 
+// 系统支持的信号总数（Linux 标准：64个信号）
 pub const NSIG: u32 = 64;
+// 信号默认处理行为（执行系统默认动作）
 pub const SIG_DFL: usize = 0;
+// 信号忽略处理行为（直接丢弃该信号）
 pub const SIG_IGN: usize = 1;
+// 强制杀死进程信号（不可被捕获、忽略、阻塞）
 pub const SIGKILL: u32 = 9;
+// 暂停进程信号（不可被捕获、忽略、阻塞）
 pub const SIGSTOP: u32 = 19;
+// 子进程状态改变时发送给父进程（退出/暂停/恢复）
 pub const SIGCHLD: u32 = 17;
+// 用户自定义信号1（程序可自由定义用途）
 pub const SIGUSR1: u32 = 10;
+// 用户自定义信号2（程序可自由定义用途）
 pub const SIGUSR2: u32 = 12;
+// 定时器超时信号（alarm() 触发）
 pub const SIGALRM: u32 = 14;
 
+// 时间轮的槽位总数（时间轮大小）
 pub const TIMER_WHEEL_SIZE: usize = 256;
+// 定时器每秒触发的时钟节拍数
 pub const TIMER_TICK_HZ: usize = 100;
 
+/// 套接字类型常量（定义数据传输方式）
+/// 流式套接字（TCP，可靠、面向连接、字节流传输）
 pub const SOCK_STREAM: u32 = 1;
+/// 数据报套接字（UDP，不可靠、无连接、数据包传输）
 pub const SOCK_DGRAM: u32 = 2;
+/// 原始套接字（直接访问底层协议，用于网络抓包/自定义协议）
 pub const SOCK_RAW: u32 = 3;
+
+/// 地址族常量（定义网络协议簇）
+/// IPv4 地址族（最常用的互联网协议）
 pub const AF_INET: u32 = 2;
+/// IPv6 地址族（下一代互联网协议）
 pub const AF_INET6: u32 = 10;
+/// Unix 域套接字（本地进程间通信，不经过网络协议栈）
 pub const AF_UNIX: u32 = 1;
 
+// === 文件 I/O 基础操作 ===
+/// 从文件描述符读取数据
 pub const SYS_READ: usize = 0;
+/// 向文件描述符写入数据
 pub const SYS_WRITE: usize = 1;
+/// 打开文件
 pub const SYS_OPEN: usize = 2;
+/// 关闭文件描述符
 pub const SYS_CLOSE: usize = 3;
+// === 文件状态/元信息 ===
+/// 获取文件状态（路径）
 pub const SYS_STAT: usize = 4;
+/// 获取文件状态（文件描述符）
 pub const SYS_FSTAT: usize = 5;
+// === 内存管理 ===
+/// 映射文件/设备到虚拟内存
 pub const SYS_MMAP: usize = 9;
+/// 取消内存映射
 pub const SYS_MUNMAP: usize = 11;
+/// 调整程序中断（堆内存扩展）
 pub const SYS_BRK: usize = 12;
+// === 设备/IO控制 ===
+/// 设备控制
 pub const SYS_IOCTL: usize = 16;
+// === 进程间通信 ===
+/// 创建管道
 pub const SYS_PIPE: usize = 22;
+// === 文件描述符复制 ===
+/// 复制文件描述符
 pub const SYS_DUP: usize = 32;
+/// 定向复制文件描述符
 pub const SYS_DUP2: usize = 33;
-pub const SYS_FORK: usize = 57;
-pub const SYS_EXEC: usize = 59;
-pub const SYS_EXIT: usize = 60;
-pub const SYS_WAIT4: usize = 61;
-pub const SYS_KILL: usize = 62;
-pub const SYS_FCNTL: usize = 72;
-pub const SYS_GETPID: usize = 39;
-pub const SYS_GETPPID: usize = 110;
-pub const SYS_SETPGID: usize = 109;
-pub const SYS_GETPGID: usize = 121;
-pub const SYS_SETSID: usize = 112;
-pub const SYS_EPOLL_CREATE: usize = 213;
-pub const SYS_EPOLL_CTL: usize = 233;
-pub const SYS_EPOLL_WAIT: usize = 232;
-pub const SYS_CLOCK_GETTIME: usize = 228;
+// === 信号处理 ===
+/// 设置信号处理函数
 pub const SYS_SIGACTION: usize = 13;
+/// 操作信号掩码
 pub const SYS_SIGPROCMASK: usize = 14;
+// === 进程管理核心 ===
+/// 创建子进程
+pub const SYS_FORK: usize = 57;
+/// 执行新程序
+pub const SYS_EXEC: usize = 59;
+/// 终止进程
+pub const SYS_EXIT: usize = 60;
+/// 等待子进程
+pub const SYS_WAIT4: usize = 61;
+/// 向进程发送信号
+pub const SYS_KILL: usize = 62;
+// === 文件描述符控制 ===
+/// 文件描述符控制
+pub const SYS_FCNTL: usize = 72;
+// === 进程标识 ===
+/// 获取当前进程ID
+pub const SYS_GETPID: usize = 39;
+/// 获取父进程ID
+pub const SYS_GETPPID: usize = 110;
+// === 进程组/会话 ===
+/// 设置进程组ID
+pub const SYS_SETPGID: usize = 109;
+/// 获取进程组ID
+pub const SYS_GETPGID: usize = 121;
+/// 创建新会话
+pub const SYS_SETSID: usize = 112;
+// === 高性能IO（epoll） ===
+/// 创建epoll实例
+pub const SYS_EPOLL_CREATE: usize = 213;
+/// 控制epoll监听事件
+pub const SYS_EPOLL_CTL: usize = 233;
+/// 等待epoll事件
+pub const SYS_EPOLL_WAIT: usize = 232;
+// === 时间 ===
+/// 获取时钟时间
+pub const SYS_CLOCK_GETTIME: usize = 228;
+// === 线程/同步 ===
+/// 快速用户空间互斥锁（线程同步核心）
 pub const SYS_FUTEX: usize = 202;
 
+/// IO 队列深度
 pub const IOQUEUE_DEPTH: usize = 128;
 
+// 虚存区域
 pub struct VmRegion {
-    pub base: usize,
-    pub len: usize,
-    pub flags: u32,
-    pub offset: usize,
-    pub tag: u16,
-    pub ref_count: AtomicUsize,
+    pub base: usize,       // 虚拟内存起始地址
+    pub len: usize,       // 这段内存的长度（字节数）
+    pub flags: u32,       // 权限/属性：读、写、执行、共享、私有等
+    pub offset: usize,    // 若映射文件/设备，文件内的偏移量
+    pub tag: u16,         // 内存类型标记（内核内部分类用）
+    pub ref_count: AtomicUsize, // 引用计数（多线程安全）
 }
 
+// 进程权限能力集
 pub struct CapSet {
-    pub bits: u64,
-    pub effective: u64,
-    pub ambient: u64,
+    pub bits: u64,       // 允许拥有的能力全集
+    pub effective: u64,  // 当前正在生效的能力
+    pub ambient: u64,    // 可继承给子进程的能力
 }
 
+// 信号处理动作
 pub struct SigAction {
-    pub handler: usize,
-    pub flags: u32,
-    pub mask: u64,
+    pub handler: usize,  // 信号处理函数的指针（地址）
+    pub flags: u32,      // 处理方式标志：重启系统调用、忽略等
+    pub mask: u64,       // 处理时要临时屏蔽的其他信号
 }
 
+// 信号集合状态
 pub struct SigSet {
-    pub pending: u64,
-    pub blocked: u64,
-    pub actions: Vec<SigAction>,
+    pub pending: u64,    // 已经发来、但还没处理的信号
+    pub blocked: u64,    // 暂时屏蔽、不响应的信号
+    pub actions: Vec<SigAction>, // 每个信号对应的处理动作
 }
 
+// 内核定时器
 pub struct TimerEntry {
-    pub deadline: usize,
-    pub interval: usize,
-    pub callback_id: usize,
-    pub active: bool,
-    pub repeat: bool,
+    pub deadline: usize,   // 到期时间戳
+    pub interval: usize,   // 重复间隔（周期性定时器用）
+    pub callback_id: usize,// 要执行的回调函数 ID
+    pub active: bool,      // 定时器是否启用
+    pub repeat: bool,      // 是否循环触发
 }
 
+// 内核锁(包含自旋锁的功能)
 pub struct KernLock {
-    flag: AtomicBool,
-    holder: AtomicUsize,
-    depth: AtomicUsize,
+    flag: AtomicBool,      // 锁是否被占用
+    holder: AtomicUsize,   // 谁持有这把锁（CPU/线程 ID）
+    depth: AtomicUsize,    // 可重入次数（同一线程多次加锁）
 }
 impl KernLock {
     pub const fn new() -> Self {
         Self { flag: AtomicBool::new(false), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0) }
     }
+    // spinlock
     pub fn enter(&self, id: usize) {
         if self.holder.load(Ordering::Relaxed) == id && id != 0 {
             self.depth.fetch_add(1, Ordering::Relaxed);
@@ -221,6 +379,7 @@ impl KernLock {
         self.holder.store(id, Ordering::Relaxed);
         self.depth.store(1, Ordering::Relaxed);
     }
+    // release the lock
     pub fn leave(&self) {
         let d = self.depth.load(Ordering::Relaxed);
         let h = self.holder.load(Ordering::Relaxed);
@@ -229,9 +388,13 @@ impl KernLock {
         self.depth.store(0, Ordering::Relaxed);
         self.flag.store(false, Ordering::Release);
     }
+    // check whether be held
     pub fn held(&self) -> bool { self.flag.load(Ordering::Relaxed) }
+    // query the owner
     pub fn owner(&self) -> usize { self.holder.load(Ordering::Relaxed) }
+    // query the depth
     pub fn level(&self) -> usize { self.depth.load(Ordering::Relaxed) }
+    // try to get the lock(fail and return false instead of looping)
     pub fn try_enter(&self, id: usize) -> bool {
         if self.holder.load(Ordering::Relaxed) == id && id != 0 {
             self.depth.fetch_add(1, Ordering::Relaxed);
@@ -250,24 +413,38 @@ unsafe impl Send for KernLock {}
 unsafe impl Sync for KernLock {}
 pub static GKL: KernLock = KernLock::new();
 
+// 内存分区/页域管理信息结构体
 pub struct ZoneInfo {
+    /// 分区唯一标识ID
     pub zone_id: usize,
+    /// 起始页帧号(Page Frame Number)
     pub base_pfn: usize,
+    /// 该分区总物理页数
     pub page_count: usize,
+    /// 空闲页数量（原子操作，多线程安全）
     pub free_count: AtomicUsize,
+    /// 低水位线：空闲页低于此值触发内存回收/扩容
     pub low_watermark: usize,
+    /// 高水位线：空闲页高于此值停止内存释放
     pub high_watermark: usize,
+    /// 是否处于托管管理状态（原子布尔）
     pub managed: AtomicBool,
 }
 
+/// 基础环形缓冲区（字节流专用）
 pub struct CircBuf {
+    /// 底层存储字节数组
     pub data: Vec<u8>,
+    /// 读索引位置
     pub rd: usize,
+    /// 写索引位置
     pub wr: usize,
+    /// 缓冲区总容量
     pub cap: usize,
+    /// 当前已存储有效数据长度
     pub n: usize,
 }
-
+// 自旋锁
 pub struct Spin { v: AtomicBool }
 impl Spin {
     pub const fn new() -> Self { Self { v: AtomicBool::new(false) } }
@@ -289,17 +466,18 @@ pub struct FlgGuard(usize);
 impl FlgGuard { pub fn enter() -> Self { Self(0) } }
 impl Drop for FlgGuard { fn drop(&mut self) {} }
 
+// 事件位编码，用u32位编码
 pub struct EvFlag;
 impl EvFlag {
-    pub const READABLE: u32 = 1 << 0;
-    pub const WRITABLE: u32 = 1 << 1;
-    pub const ERROR: u32 = 1 << 2;
-    pub const CLOSED: u32 = 1 << 3;
-    pub const PROC_QUIT: u32 = 1 << 10;
-    pub const CHILD_QUIT: u32 = 1 << 11;
-    pub const RECV_SIG: u32 = 1 << 12;
-    pub const SEM_RM: u32 = 1 << 20;
-    pub const SEM_ACQ: u32 = 1 << 21;
+    pub const READABLE: u32 = 1 << 0;    // 可读
+    pub const WRITABLE: u32 = 1 << 1;    // 可写
+    pub const ERROR: u32 = 1 << 2;       // 错误
+    pub const CLOSED: u32 = 1 << 3;      // 关闭
+    pub const PROC_QUIT: u32 = 1 << 10;  // 进程退出
+    pub const CHILD_QUIT: u32 = 1 << 11; // 子进程退出
+    pub const RECV_SIG: u32 = 1 << 12;   // 收到信号
+    pub const SEM_RM: u32 = 1 << 20;     // 信号量移除
+    pub const SEM_ACQ: u32 = 1 << 21;    // 信号量获取
 }
 
 pub type EvCb = Box<dyn Fn(u32) -> bool + Send>;
