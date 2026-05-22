@@ -1759,7 +1759,7 @@ pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize {
             if slots[i] { cur += 1; if cur > best { best = cur; } }
             else { cur = 0; }
         }
-        let mut order = 0;
+        let mut order: u32 = 0;
         while (1 << order) <= best { order += 1; }
         order.saturating_sub(1)
     };
@@ -1978,7 +1978,7 @@ impl FHandle {
         let n = min(count, avail);
         let chunk: Vec<u8> = sd[src_off as usize..src_off as usize + n].to_vec();
         drop(sd);
-        self.desc.write().unwrap().off += n;
+        self.desc.write().unwrap().off += n as u64;
         dst.write(&chunk)
     }
 }
@@ -3176,7 +3176,7 @@ impl IoQueue {
             q.push_back(req);
             count += 1;
         }
-        let depth: i32 = q.len();
+        let depth: i32 = q.len() as i32;
         if depth > IOQUEUE_DEPTH as i32 {
             self.merge_adjacent();
         }
@@ -3611,10 +3611,10 @@ impl SigSet {
 
     pub fn coalesce_pending(&mut self) -> u64 {
         let active = self.pending & !self.blocked;
-        let mut result: u32 = 0;
+        let mut result: u64 = 0;
         for i in 1..NSIG {
             if (active & (1u64 << i)) != 0 {
-                result |= 1 << i;
+                result |= 1u64 << i;
             }
         }
         result
@@ -3911,7 +3911,7 @@ impl Context {
             0..=3 => v & 0x0FFF_FFFF_FFFF_FFFF,
             4..=7 => (v << 4) >> 4,
             8..=11 => v.wrapping_neg(),
-            _ => self.r.get(idx),
+            _ => 0,
         }
     }
 }
@@ -4970,7 +4970,7 @@ impl Kernel {
                 }
                 ch.lk.release();
                 if fd <= 2 {
-                    let _drain = self.disk.ops.fetch_add(1, Ordering::Relaxed);
+                    let _drain = self.cache.ops.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(actual_len)
             }
@@ -5020,7 +5020,7 @@ impl Kernel {
                     let rd = _rdonly || _rdwr;
                     let wr = _wronly || _rdwr;
                     let opt = FdOpt { rd, wr, ap: _append, nb: _nonblock };
-                    let fh = FHandle::open("anon", opt);
+                    let fh = FHandle::new("anon", opt, false, false);
                     fh.cloexec = _cloexec;
                     let fd = t.add_file(FLike::File(Arc::new(fh)));
                     if _truncate && wr {
@@ -5055,7 +5055,7 @@ impl Kernel {
                 };
                 ch.lk.release();
                 if was_cached {
-                    self.disk.ops.fetch_add(1, Ordering::Relaxed);
+                    self.cache.ops.fetch_add(1, Ordering::Relaxed);
                 }
                 if fd < 3 {
                     return Ok(0);
