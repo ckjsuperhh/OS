@@ -1,0 +1,36 @@
+name: Chaos Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-original:
+    name: Original kernel tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2024-01-01
+
+      - name: Run basic tests (original)
+        working-directory: chaos-tests
+        run: cargo test --test basic
+
+  test-refactored:
+    name: Refactored kernel tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2024-01-01
+
+      - name: Run basic tests (refactored)
+        working-directory: chaos-tests-refactored
+        run: cargo test --test basic
