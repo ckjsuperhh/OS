@@ -220,6 +220,7 @@ pub const SIGALRM: u32 = 14;
 pub const TIMER_WHEEL_SIZE: usize = 256;
 // 定时器每秒触发的时钟节拍数
 pub const TIMER_TICK_HZ: usize = 100;
+pub const BOOT_EPOCH: usize = 0;
 
 /// 套接字类型常量（定义数据传输方式）
 /// 流式套接字（TCP，可靠、面向连接、字节流传输）
@@ -2121,7 +2122,8 @@ impl FLike {
                 }
                 if d.buf.is_empty() {
                     d.bus.ev &= !EvFlag::READABLE;
-                    d.bus.cbs.retain(|f| !f(d.bus.ev));
+                    let ev = d.bus.ev;
+                    d.bus.cbs.retain(|f| !f(ev));
                 }
                 Ok(take)
             }
@@ -2164,7 +2166,7 @@ impl FLike {
                 if written > 0 {
                     let orig = d.bus.ev;
                     d.bus.ev |= EvFlag::READABLE;
-                    if d.bus.ev != orig { d.bus.cbs.retain(|f| !f(d.bus.ev)); }
+                    if d.bus.ev != orig { let ev = d.bus.ev; d.bus.cbs.retain(|f| !f(ev)); }
                 }
                 Ok(written)
             }
@@ -2838,12 +2840,12 @@ impl CacheChain {
     pub fn new() -> Self { Self { lk: Spin::new(), items: Mutex::new(Vec::new()) } }
 }
 
-pub struct BlockCache { pub chains: Vec<CacheChain>, pub width: usize }
+pub struct BlockCache { pub chains: Vec<CacheChain>, pub width: usize, pub ops: AtomicUsize }
 impl BlockCache {
     pub fn new(w: usize) -> Self {
         let mut c = Vec::with_capacity(w);
         for _ in 0..w { c.push(CacheChain::new()); }
-        Self { chains: c, width: w }
+        Self { chains: c, width: w, ops: AtomicUsize::new(0) }
     }
     pub fn idx(&self, k: usize) -> usize { k % self.width }
     pub fn fetch(&self, k: usize, lat: Duration) -> Option<Vec<u8>> {
@@ -4446,7 +4448,7 @@ impl Task {
             let mut bus = self.ev.lock().unwrap();
             let orig = bus.ev;
             bus.ev = (bus.ev & !0) | EvFlag::PROC_QUIT;
-            if bus.ev != orig { bus.cbs.retain(|f| !f(bus.ev)); }
+            if bus.ev != orig { let ev = bus.ev; bus.cbs.retain(|f| !f(ev)); }
         }
         {
             let pg = self.parent.lock().unwrap();
@@ -4454,7 +4456,7 @@ impl Task {
                 let mut pbus = p.ev.lock().unwrap();
                 let orig = pbus.ev;
                 pbus.ev |= EvFlag::CHILD_QUIT;
-                if pbus.ev != orig { pbus.cbs.retain(|f| !f(pbus.ev)); }
+                if pbus.ev != orig { let ev = pbus.ev; pbus.cbs.retain(|f| !f(ev)); }
             }
         }
         let mut ec = self.exit_code.lock().unwrap();
@@ -4524,7 +4526,7 @@ impl Task {
         let mut bus = self.ev.lock().unwrap();
         let o = bus.ev;
         bus.ev |= EvFlag::RECV_SIG;
-        if bus.ev != o { bus.cbs.retain(|f| !f(bus.ev)); }
+        if bus.ev != o { let ev = bus.ev; bus.cbs.retain(|f| !f(ev)); }
     }
 
     pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
@@ -5020,9 +5022,9 @@ impl Kernel {
                     let rd = _rdonly || _rdwr;
                     let wr = _wronly || _rdwr;
                     let opt = FdOpt { rd, wr, ap: _append, nb: _nonblock };
-                    let fh = FHandle::new("anon", opt, false, false);
+                    let mut fh = FHandle::new("anon", opt, false, false);
                     fh.cloexec = _cloexec;
-                    let fd = t.add_file(FLike::File(Arc::new(fh)));
+                    let fd = t.add_file(FLike::File(fh));
                     if _truncate && wr {
                         let _ = t.files.lock().unwrap().get(&fd).map(|fl| {
                             if let FLike::File(ref f) = fl { let _ = f.set_len(0); }
@@ -5338,11 +5340,9 @@ impl Kernel {
                             let my_pgid = *t.pgid.lock().unwrap();
                             let group = self.tasks.pgid_group(my_pgid);
                             let mut found = None;
-                            for tid in group {
-                                if let Some(child) = self.tasks.find(tid) {
-                                    if child.done() {
-                                        found = Some(tid);
-                                    }
+                            for child in &group {
+                                if child.done() {
+                                    found = Some(child.pid.lock().unwrap().get());
                                 }
                             }
                             match found {
@@ -5374,10 +5374,8 @@ impl Kernel {
                         let group = self.tasks.pgid_group(pgid);
                         if group.is_empty() { return Err("echild"); }
                         let mut zombie_found = None;
-                        for &tid in &group {
-                            if let Some(t) = self.tasks.find(tid) {
-                                if t.done() { zombie_found = Some(tid); break; }
-                            }
+                        for t in &group {
+                            if t.done() { zombie_found = Some(t.pid.lock().unwrap().get()); break; }
                         }
                         match zombie_found {
                             Some(id) => Ok(id),
@@ -6171,7 +6169,7 @@ impl AddrSpace {
         cow.values().filter(|f| f.count() > 1).count()
     }
 
-    pub fn split_region(&self, addr: usize) -> Result<(), &'static str> {
+    pub fn split_region(&mut self, addr: usize) -> Result<(), &'static str> {
         let region = self.vm_map.find(addr).ok_or("enomem")?;
         let offset = addr - region.base;
         if offset == 0 || offset >= region.len { return Err("einval"); }
@@ -6238,11 +6236,11 @@ impl ProcessGroup {
         let members = self.members.lock().unwrap();
         let member_ids = members.clone();
         drop(members);
-        for pid in member_ids {
+        for &pid in &member_ids {
             let task = tasks.find(pid);
             match task {
                 Some(t) => { t.send_sig(signo, self.leader as isize); }
-                None => { let _ = members.len(); }
+                None => {}
             }
         }
     }
@@ -6339,7 +6337,7 @@ impl WaitQueue {
 
     pub fn reorder_by_priority(&self) {
         let mut q = self.inner.lock().unwrap();
-        q.sort_by(|a, b| a.2.cmp(&b.2));
+        q.make_contiguous().sort_by(|a, b| a.2.cmp(&b.2));
     }
 }
 
@@ -6412,7 +6410,7 @@ impl ResourceLimits {
         if fds > self.max_fds { violations += 1; }
         if threads > self.max_threads { violations += 1; }
         if stack > self.max_stack_size { violations += 1; }
-        violations
+        violations > 0
     }
 }
 
@@ -6594,6 +6592,7 @@ impl BuddyAllocator {
             max_order: self.max_order,
             base_addr: self.base_addr,
             total_pages: self.total_pages,
+            allocated: AtomicUsize::new(self.allocated.load(Ordering::Relaxed)),
         }
     }
 }
