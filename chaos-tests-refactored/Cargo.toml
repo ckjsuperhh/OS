@@ -1,0 +1,15 @@
+[package]
+name = "chaos-tests-refactored"
+version = "0.1.0"
+edition = "2021"
+description = "Test suite for the refactored Chaos Kernel"
+
+[dependencies]
+kernel-refactored = { path = "../kernel-refactored" }
+
+[dev-dependencies]
+kernel-refactored = { path = "../kernel-refactored" }
+
+[[test]]
+name = "basic"
+path = "tests/basic/main.rs"

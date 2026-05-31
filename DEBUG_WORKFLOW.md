@@ -422,3 +422,76 @@ loop {
 1. 其他线程无法获取 guard 来写入数据（死锁风险）
 2. 单处理器场景下永远无法解除阻塞
 测试验证：接收线程阻塞 200ms 后，guard 不应被持有。
+
+---
+
+## Task 2: 代码模块化重写
+
+### 概述
+
+将 6600 行的单体 `kernel/src/kernel.rs` 拆分为 13 个独立模块，放入 `kernel-refactored/` 目录，原版保持不变。配套测试项目 `chaos-tests-refactored/` 依赖新版库。
+
+### 模块架构
+
+| 模块 | 文件 | 行数 | 职责 |
+|------|------|------|------|
+| consts | `consts.rs` | 208 | 系统常量、syscall 编号、类型别名 |
+| sync | `sync.rs` | 439 | KernLock, Spin, Sema, Futex, SyncQueue, EvBus |
+| signal | `signal.rs` | 108 | SigAction, SigSet（信号处理） |
+| timer | `timer.rs` | 99 | TimerEntry, TimerWheel（时间轮调度） |
+| memory | `memory.rs` | 895 | VmRegion, VmMap, FramePool, PgFrame, BuddyAllocator, SlabEntry |
+| util | `util.rs` | 288 | check_access, 网络校验和, ELF 验证, 时钟工具函数, CLK 全局变量 |
+| channel | `channel.rs` | 277 | Channel, CircBuf（线程间消息传递） |
+| fs | `fs.rs` | 1371 | FHandle, PipeNode, FLike, BlockCache, Disk, IoQueue, MountTable, PageCache, EpInst |
+| ipc | `ipc.rs` | 185 | SemArr, SemCtx, ShmCtx（System V 信号量与共享内存） |
+| trap | `trap.rs` | 368 | TrapCtl, Context（中断控制与寄存器上下文） |
+| process | `process.rs` | 615 | Task, TaskTable, Pid, CapSet, ProcInit |
+| sched | `sched.rs` | 211 | RunQueue, SchedulePolicy（CPU 调度） |
+| kernel | `kernel.rs` | 1204 | Kernel struct + dispatch_syscall（全局协调器） |
+| **lib** | `lib.rs` | 30 | 模块声明 + re-export |
+| **总计** | | **6268** | |
+
+### 编译修复
+
+拆分后遇到 20 个编译错误，主要类型：
+- **导入路径错误**（8 处）：`crate::context::*` 应为 `crate::trap::Context`，`crate::kernel::CLK` 应为 `crate::util::CLK`
+- **私有字段访问**（5 处）：`FramePool` 的 `slots` 和 `cap` 字段需要改为 `pub`
+- **缺少导入**（4 处）：`validate_elf_header`、`Context` 等需要显式导入
+- **类型 trait 缺失**（3 处）：`FdOpt` 需要 `#[derive(Clone, Copy)]`
+
+### 测试结果
+
+| 版本 | Basic 测试 | 状态 |
+|------|-----------|------|
+| 原版 `chaos-tests` | 33/33 | ✅ |
+| 重构版 `chaos-tests-refactored` | 33/33 | ✅ |
+
+### 目录结构
+
+```
+chaos/
+├── kernel/                     # 原版（保留）
+│   └── src/kernel.rs           # 6600 行单体文件
+├── kernel-refactored/          # 新版（模块化）
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs              # mod 声明 + pub use re-export
+│       ├── consts.rs           # 常量
+│       ├── sync.rs             # 同步原语
+│       ├── signal.rs           # 信号
+│       ├── timer.rs            # 定时器
+│       ├── memory.rs           # 内存管理
+│       ├── util.rs             # 工具函数
+│       ├── channel.rs          # 消息通道
+│       ├── fs.rs               # 文件系统
+│       ├── ipc.rs              # IPC
+│       ├── trap.rs             # 中断/上下文
+│       ├── process.rs          # 进程管理
+│       ├── sched.rs            # 调度器
+│       └── kernel.rs           # 内核协调器
+├── chaos-tests/                # 原版测试（保留）
+├── chaos-tests-refactored/     # 新版测试
+│   ├── Cargo.toml              # 依赖 kernel-refactored
+│   └── tests/basic/            # 测试文件（import 改为 kernel_refactored::*）
+└── DEBUG_WORKFLOW.md           # 本文档
+```

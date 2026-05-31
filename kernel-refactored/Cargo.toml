@@ -1,0 +1,5 @@
+[package]
+name = "kernel-refactored"
+version = "0.1.0"
+edition = "2021"
+description = "Refactored modular Chaos Kernel — rewritten for readability and structure"
