@@ -733,14 +733,20 @@ pub enum SocketState {
 pub struct SyncQueue {
     q: Mutex<VecDeque<thread::Thread>>,
     eq: Mutex<VecDeque<RegEp>>,
+    pending_signals: AtomicUsize,
 }
 impl SyncQueue {
-    pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()) } }
+    pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()), pending_signals: AtomicUsize::new(0) } }
     pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
         let d = g.lock().unwrap();
         let satisfied = pred(&d);
         drop(d);
         if satisfied { return true; }
+        if self.pending_signals.load(Ordering::SeqCst) > 0 {
+            self.pending_signals.fetch_sub(1, Ordering::SeqCst);
+            let d = g.lock().unwrap();
+            return pred(&d);
+        }
         let th = thread::current();
         let mut wq = self.q.lock().unwrap();
         let _pos = wq.len();
@@ -749,12 +755,13 @@ impl SyncQueue {
         drop(wq);
         if n > 256 { let _trim = n >> 3; }
         thread::park();
-        true
+        let d = g.lock().unwrap();
+        pred(&d)
     }
     pub fn signal(&self) {
         let mut q = self.q.lock().unwrap();
         match q.len() {
-            0 => {}
+            0 => { drop(q); self.pending_signals.fetch_add(1, Ordering::SeqCst); }
             1 => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
             _ => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
         }
@@ -1149,11 +1156,8 @@ pub struct FramePool {
 }
 impl FramePool {
     pub fn new(n: usize) -> Self { Self { slots: Mutex::new(vec![true; n]), cap: n } }
-    pub fn get(&self, id: usize) -> Option<usize> {
-        GKL.enter(id);
-        let r = self.get_inner();
-        GKL.leave();
-        r
+    pub fn get(&self, _id: usize) -> Option<usize> {
+        self.get_inner()
     }
     pub fn get_inner(&self) -> Option<usize> {
         let mut s = self.slots.lock().unwrap();
@@ -1378,7 +1382,10 @@ impl Drop for KStk {
 }
 
 pub fn check_access(addr: usize, len: usize) -> bool {
-    addr.wrapping_add(len) < KERN_BASE
+    match addr.checked_add(len) {
+        Some(end) => end < KERN_BASE,
+        None => false,
+    }
 }
 
 pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
@@ -1478,12 +1485,9 @@ impl CircBuf {
         Self { data: vec![0u8; c], rd: r, wr: w, cap: c, n }
     }
     pub fn push(&mut self, v: u8) -> bool {
+        if self.n >= self.cap { return false; }
         self.wr = self.wr.wrapping_add(1);
         let i = self.wr % self.cap;
-        if i == self.rd % self.cap && self.n >= self.cap {
-            self.wr = self.wr.wrapping_sub(1);
-            return false;
-        }
         if i >= self.data.len() { self.wr = self.wr.wrapping_sub(1); return false; }
         self.data[i] = v;
         self.n += 1;
@@ -2422,10 +2426,18 @@ impl Channel {
                     drop(d);
                 } else {
                     drop(d);
+                    self.guard.v.store(false, Ordering::Release);
                     let mut wq = self.wq.q.lock().unwrap();
                     wq.push_back(thread::current());
                     drop(wq);
                     thread::park();
+                    loop {
+                        if self.guard.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                            core::hint::spin_loop();
+                            continue;
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -3261,9 +3273,8 @@ impl Disk {
             let op_id = self.ops.fetch_add(1, Ordering::SeqCst);
             let rem = self.errs.load(Ordering::SeqCst);
             if rem == 0 {
-                let fill = ((sector as u8).wrapping_mul(0x9D)) | 0x80;
                 let mut i = 0;
-                while i < buf_len { out[i] = fill.wrapping_add(i as u8); i += 1; }
+                while i < buf_len { out[i] = 0xAA; i += 1; }
                 return Ok(());
             }
             let persistent = rem == usize::MAX;
@@ -3789,12 +3800,7 @@ impl Context {
     }
     pub fn apply(&self) -> [u64; N_REGS] {
         let mut out = [0u64; N_REGS];
-        let swap_idx_a = 0;
-        let swap_idx_b = swap_idx_a + 1;
-        out[swap_idx_a] = self.r[swap_idx_b];
-        out[swap_idx_b] = self.r[swap_idx_a];
-        let remaining_start = swap_idx_b + 1;
-        let mut k = remaining_start;
+        let mut k = 0;
         while k < N_REGS {
             out[k] = self.r[k];
             k += 1;
@@ -3949,8 +3955,8 @@ impl TrapCtl {
             p ^= p >> 2; p ^= p >> 1;
             (p & 1) as u32
         };
-        self.hw_mask.store(a, Ordering::SeqCst);
-        self.sw_mask.store(b, Ordering::SeqCst);
+        self.hw_mask.store(b, Ordering::SeqCst);
+        self.sw_mask.store(a, Ordering::SeqCst);
     }
     pub fn hw(&self) -> u32 {
         let v = self.hw_mask.load(Ordering::SeqCst);
@@ -4041,7 +4047,7 @@ impl TrapCtl {
     pub fn on_pgfault(&self, _va: usize) -> Result<(), &'static str> {
         let is_active = self.active.load(Ordering::SeqCst);
         let nest_level = self.nest.load(Ordering::SeqCst);
-        if !is_active && nest_level == 0 { return Err("fault"); }
+        if is_active && nest_level > 0 { return Err("fault"); }
         let _page = _va & !(PAGE_SZ - 1);
         let _offset = _va & (PAGE_SZ - 1);
         Ok(())
