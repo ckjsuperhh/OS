@@ -1,0 +1,59 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly-2024-01-01
+        components: rustfmt, clippy
+    - name: Check code format
+      continue-on-error: true
+      run: cd kernel && cargo fmt -- --check
+
+  build:
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        arch: [x86_64, riscv64, aarch64]
+    steps:
+    - uses: actions/checkout@v4
+    - name: Checkout submodules
+      run: git submodule update --init --recursive || true
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly-2024-01-01
+        components: rust-src, llvm-tools-preview
+
+    - name: Cache QEMU
+      uses: actions/cache@v4
+      with:
+        path: qemu-4.2.0
+        key: ${{ runner.os }}-${{ matrix.arch }}-qemu
+
+    - name: Install QEMU
+      run: |
+        if [ ! -d qemu-4.2.0 ]; then
+          wget -q https://download.qemu.org/qemu-4.2.0.tar.xz
+          tar xJf qemu-4.2.0.tar.xz > /dev/null
+          cd qemu-4.2.0 && ./configure --target-list=${{ matrix.arch }}-softmmu && sudo make install -j$(nproc) && cd ..
+        fi
+
+    - name: Install dependencies
+      run: sudo apt-get install -y device-tree-compiler
+
+    - name: Download prebuilt user image
+      run: cd user && make sfsimg ARCH=${{ matrix.arch }} PREBUILT=1 && cd ..
+
+    - name: Build kernel
+      run: cd kernel && make build ARCH=${{ matrix.arch }} && cd ..
+
+    - name: Build kernel with hypervisor
+      if: runner.os == 'Linux' && matrix.arch == 'x86_64'
+      run: cd kernel && make build ARCH=${{ matrix.arch }} HYPERVISOR=on && cd ..
