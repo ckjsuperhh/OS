@@ -687,3 +687,131 @@ let tmp = b.lock().unwrap().clone();  // Guard 在这里 drop
 ```
 
 在 Rust 中，临时变量的生命周期延续到**包含它的最内层语句结束**。这意味着一行代码中的多个 `.lock()` 调用会产生同时持有的锁，即使代码看起来是"顺序执行"的。
+
+---
+
+## Commit 7: `e7acf63` — 消除所有剩余嵌套锁死锁（9 处）
+
+对 `adv_scheduler_fs_memory_deadlock_chain` 持续失败的深入分析，发现更多嵌套锁模式。
+
+### Bug 42: `TaskTable::process_of_tid` — `map.read` + `threads.lock`
+
+```rust
+// 修复前：map.read() 在迭代器链中存活，同时获取 t.threads.lock()
+self.map.read().unwrap().values()
+    .find(|t| t.threads.lock().unwrap().contains(&tid))
+    .cloned()
+// 修复后：先收集所有 task，释放 map.read，再检查 threads
+let tasks: Vec<Arc<Task>> = self.map.read().unwrap().values().cloned().collect();
+tasks.into_iter().find(|t| t.threads.lock().unwrap().contains(&tid))
+```
+
+### Bug 43: `TaskTable::pgid_group` — `map.read` + `pgid.lock`
+
+同上模式：先收集 task 列表，释放 `map.read`，再逐个检查 `pgid`。
+
+### Bug 44: `Task::exited` — `threads.lock` + `info.lock`
+
+```rust
+// 修复前：threads.lock 的 Guard 存活到 || 短路求值的右侧
+let t = self.threads.lock().unwrap();
+t.is_empty() || self.info.lock().unwrap().status.is_some()
+// 修复后：先求值 is_empty，Guard 在此 drop
+let empty = self.threads.lock().unwrap().is_empty();
+empty || self.info.lock().unwrap().status.is_some()
+```
+
+### Bug 45: `Task::has_sig` — `sig_queue.lock` + `sig_mask.lock`
+
+```rust
+// 修复前：持有 sig_queue 时获取 sig_mask
+let sq = self.sig_queue.lock().unwrap();
+if sq.is_empty() { return false; }
+let sm = *self.sig_mask.lock().unwrap();  // 🔴 嵌套
+// 修复后：先读 sig_mask，释放，再锁 sig_queue
+let sm = *self.sig_mask.lock().unwrap();
+let sq = self.sig_queue.lock().unwrap();
+```
+
+### Bug 46: `FHandle::write` — `desc.read` + `data.lock`
+
+```rust
+// 修复前：desc.read() 存活到 if 分支内的 data.lock()
+let d = self.desc.read().unwrap();
+if d.opt.ap { self.data.lock().unwrap().len() as u64 }  // 🔴 嵌套
+// 修复后：先读 desc 字段到局部变量，释放 desc，再按需访问 data
+let (is_append, cur_off) = {
+    let d = self.desc.read().unwrap();
+    (d.opt.ap, d.off)
+};
+let off = if is_append { self.data.lock().unwrap().len() as u64 } else { cur_off };
+```
+
+### Bug 47: `FHandle::seek` — `desc.write` + `data.lock`
+
+```rust
+// 修复前：desc.write() 存活到 FSeek::End 分支
+let mut d = self.desc.write().unwrap();
+d.off = match pos {
+    FSeek::End(o) => (self.data.lock().unwrap().len() as i64 + o) as u64,  // 🔴
+    ...
+};
+// 修复后：先读 data 长度，释放，再锁 desc
+let data_len = match pos {
+    FSeek::End(_) => self.data.lock().unwrap().len() as i64,
+    _ => 0,
+};
+let mut d = self.desc.write().unwrap();
+```
+
+### Bug 48: `FLike::write` File 分支 — 同 FHandle::write
+
+同 Bug 46 的修复方式：先读 desc 标志到局部变量，释放 desc，再按需访问 data。
+
+### Bug 49: `SYS_EXIT` 父进程重分配 — `child.parent` + `init.subtasks`
+
+```rust
+// 修复前：持有 child.parent 时获取 init.subtasks
+*child.parent.lock().unwrap() = Some(init_task.clone());
+init_task.subtasks.lock().unwrap().push(child);  // 🔴 嵌套
+// 修复后：分两步操作
+for child in children {
+    *child.parent.lock().unwrap() = Some(init_task.clone());  // 设置 parent，释放
+}
+// 单独操作 subtasks
+if let Some(ref init_task) = self.tasks.find(1) {
+    let mut subs = init_task.subtasks.lock().unwrap();
+    for child in t.subtasks.lock().unwrap().iter() {
+        subs.push(child.clone());
+    }
+}
+```
+
+### Bug 50: `Kernel::do_fork` — `parent.files` + `fh.data`
+
+```rust
+// 修复前：持有 parent.files 时获取 fh.data
+let files = parent.files.lock().unwrap();
+for (_, fl) in files.iter() {
+    FLike::File(fh) => { total += fh.data.lock().unwrap().len() / PAGE_SZ + 1; }  // 🔴
+}
+// 修复后：先克隆文件列表，释放 files，再遍历
+let file_list: Vec<FLike> = parent.files.lock().unwrap().values().cloned().collect();
+for fl in &file_list {
+    FLike::File(fh) => { total += fh.data.lock().unwrap().len() / PAGE_SZ + 1; }  // ✅
+}
+```
+
+### 修复总结
+
+| 函数 | 嵌套锁 | 修复方式 |
+|------|--------|---------|
+| process_of_tid | map.read → threads | 先收集再过滤 |
+| pgid_group | map.read → pgid | 先收集再过滤 |
+| exited | threads → info | 先求值再短路 |
+| has_sig | sig_queue → sig_mask | 调换获取顺序 |
+| FHandle::write | desc → data | 先读标志再访问数据 |
+| FHandle::seek | desc → data | 先读数据长度 |
+| FLike::write | desc → data | 同 FHandle::write |
+| SYS_EXIT | parent → subtasks | 分两步操作 |
+| do_fork | files → fh.data | 先克隆再遍历 |
