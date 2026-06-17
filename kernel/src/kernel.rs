@@ -2887,8 +2887,12 @@ impl BlockCache {
             ch.lk.v.store(false, Ordering::Release);
             return Some(data);
         }
+        ch.lk.v.store(false, Ordering::Release);
         let tick_before = CLK.load(Ordering::Relaxed);
         if lat.as_nanos() > 0 { thread::sleep(lat); }
+        while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
         let block_data = {
             let mut payload = Vec::with_capacity(512);
             let seed = k.wrapping_mul(0x9E3779B9) ^ tick_before;
@@ -5747,12 +5751,15 @@ impl Kernel {
     }
 
     pub fn balance_load(&self) -> usize {
-        let cpus = self.cpus.lock().unwrap();
+        let tasks: Vec<Option<Arc<Task>>> = {
+            let cpus = self.cpus.lock().unwrap();
+            cpus.iter().map(|slot| slot.clone()).collect()
+        };
         let mut counts = vec![0usize; MAX_CPU];
         let mut prios = vec![0i32; MAX_CPU];
         let mut blocked = vec![false; MAX_CPU];
         let mut total_load: u64 = 0;
-        for (i, slot) in cpus.iter().enumerate() {
+        for (i, slot) in tasks.iter().enumerate() {
             if let Some(ref t) = slot {
                 counts[i] = t.n_children() + 1;
                 prios[i] = *t.pgid.lock().unwrap();
