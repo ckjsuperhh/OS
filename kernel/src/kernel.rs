@@ -4461,8 +4461,11 @@ impl Task {
             if bus.ev != orig { let ev = bus.ev; bus.cbs.retain(|f| !f(ev)); }
         }
         {
-            let pg = self.parent.lock().unwrap();
-            if let Some(ref p) = *pg {
+            let parent_ref = {
+                let pg = self.parent.lock().unwrap();
+                pg.clone()
+            };
+            if let Some(ref p) = parent_ref {
                 let mut pbus = p.ev.lock().unwrap();
                 let orig = pbus.ev;
                 pbus.ev |= EvFlag::CHILD_QUIT;
@@ -4693,8 +4696,10 @@ impl TaskTable {
         }
         let pg = { *src.pgid.lock().unwrap() };
         *tgt.pgid.lock().unwrap() = pg;
-        *tgt.sem_ctx.lock().unwrap() = src.sem_ctx.lock().unwrap().clone();
-        *tgt.shm_ctx.lock().unwrap() = src.shm_ctx.lock().unwrap().clone();
+        let sem_clone = src.sem_ctx.lock().unwrap().clone();
+        *tgt.sem_ctx.lock().unwrap() = sem_clone;
+        let shm_clone = src.shm_ctx.lock().unwrap().clone();
+        *tgt.shm_ctx.lock().unwrap() = shm_clone;
         let smask = { *src.sig_mask.lock().unwrap() };
         *tgt.sig_mask.lock().unwrap() = smask;
         *tgt.parent.lock().unwrap() = Some(src.clone());
@@ -5953,7 +5958,11 @@ impl Kernel {
         for child in &children {
             let matches = match target_pid {
                 -1 => true,
-                0 => *child.pgid.lock().unwrap() == *parent.pgid.lock().unwrap(),
+                0 => {
+                    let child_pgid = *child.pgid.lock().unwrap();
+                    let parent_pgid = *parent.pgid.lock().unwrap();
+                    child_pgid == parent_pgid
+                },
                 p if p > 0 => child.id() == p as usize,
                 p => *child.pgid.lock().unwrap() == (-p) as Pgid,
             };
