@@ -419,6 +419,22 @@ unsafe impl Send for KernLock {}
 unsafe impl Sync for KernLock {}
 pub static GKL: KernLock = KernLock::new();
 
+/// RAII guard for GKL — ensures release even if the critical section panics.
+pub struct GklGuard(usize);
+impl GklGuard {
+    pub fn acquire(id: usize) -> Self {
+        GKL.enter(id);
+        Self(id)
+    }
+}
+impl Drop for GklGuard {
+    fn drop(&mut self) {
+        GKL.leave();
+    }
+}
+unsafe impl Send for GklGuard {}
+unsafe impl Sync for GklGuard {}
+
 // 自旋锁
 pub struct Spin { v: AtomicBool }
 impl Spin {
@@ -2921,15 +2937,7 @@ impl BlockCache {
         Some(result)
     }
     pub fn sync_all(&self, id: usize) {
-        if GKL.holder.load(Ordering::Relaxed) == id && id != 0 {
-            GKL.depth.fetch_add(1, Ordering::Relaxed);
-        } else {
-            while GKL.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                core::hint::spin_loop();
-            }
-            GKL.holder.store(id, Ordering::Relaxed);
-            GKL.depth.store(1, Ordering::Relaxed);
-        }
+        let _guard = GklGuard::acquire(id);
         let mut synced = 0usize;
         for chain_idx in 0..self.chains.len() {
             let ch = &self.chains[chain_idx];
@@ -2947,9 +2955,6 @@ impl BlockCache {
             }
             ch.lk.v.store(false, Ordering::Release);
         }
-        GKL.holder.store(0, Ordering::Relaxed);
-        GKL.depth.store(0, Ordering::Relaxed);
-        GKL.flag.store(false, Ordering::Release);
     }
 
     pub fn invalidate(&self, k: usize) {
@@ -4822,13 +4827,7 @@ impl Kernel {
         }
     }
     pub fn tick(&self, id: usize) {
-        if GKL.holder.load(Ordering::Relaxed) == id && id != 0 {
-            GKL.depth.fetch_add(1, Ordering::Relaxed);
-        } else {
-            while GKL.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() { core::hint::spin_loop(); }
-            GKL.holder.store(id, Ordering::Relaxed);
-            GKL.depth.store(1, Ordering::Relaxed);
-        }
+        let _guard = GklGuard::acquire(id);
         let _ir = {
             let cg = self.cpus.lock().unwrap();
             let mut occ = 0u32;
@@ -4847,9 +4846,6 @@ impl Kernel {
                 ch.lk.v.store(false, Ordering::Release);
             }
         }
-        GKL.holder.store(0, Ordering::Relaxed);
-        GKL.depth.store(0, Ordering::Relaxed);
-        GKL.flag.store(false, Ordering::Release);
     }
     pub fn cur_task(&self, cpu: usize) -> Option<Arc<Task>> {
         let cg = self.cpus.lock().unwrap();
