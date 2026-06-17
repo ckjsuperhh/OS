@@ -815,3 +815,76 @@ for fl in &file_list {
 | FLike::write | desc → data | 同 FHandle::write |
 | SYS_EXIT | parent → subtasks | 分两步操作 |
 | do_fork | files → fh.data | 先克隆再遍历 |
+
+---
+
+## Commit 8: `bb5f6b2` — GKL RAII 保护：防止 panic 导致全局锁泄漏
+
+### Bug 51: `Kernel::tick` 和 `BlockCache::sync_all` 手动管理 GKL，panic 时锁永不释放
+
+**问题根因**：
+
+`Kernel::tick` 和 `BlockCache::sync_all` 手动调用 `GKL.enter()`/`GKL.leave()` 管理全局内核锁。如果在 enter 和 leave 之间的代码发生 panic（例如 `ch.items.lock().unwrap()` 遇到 poisoned mutex），panic 会跳过 leave 调用，导致 **GKL 永远不会释放**。后续所有尝试获取 GKL 的线程都会永远自旋等待，整个系统死锁。
+
+```rust
+// 修复前：手动管理，panic 时 GKL 泄漏
+pub fn tick(&self, id: usize) {
+    // 手动获取 GKL
+    while GKL.flag.compare_exchange(false, true, ...).is_err() { spin_loop(); }
+    GKL.holder.store(id, ...);
+    GKL.depth.store(1, ...);
+
+    // 如果这里 panic（例如 unwrap 遇到 poisoned mutex）：
+    let cg = self.cpus.lock().unwrap();  // 💥 panic!
+    // ... 中间代码 ...
+    let items = ch.items.lock().unwrap(); // 💥 也可能 panic!
+
+    // 这些永远不会执行：
+    GKL.holder.store(0, ...);
+    GKL.flag.store(false, ...);  // GKL 泄漏！
+}
+```
+
+**修复方案：RAII Guard**
+
+```rust
+// 新增 RAII 守卫结构
+pub struct GklGuard(usize);
+impl GklGuard {
+    pub fn acquire(id: usize) -> Self {
+        GKL.enter(id);
+        Self(id)
+    }
+}
+impl Drop for GklGuard {
+    fn drop(&mut self) {
+        GKL.leave();  // 即使 panic 也会执行
+    }
+}
+
+// 修复后：RAII 保证 GKL 释放
+pub fn tick(&self, id: usize) {
+    let _guard = GklGuard::acquire(id);  // 获取 GKL
+    // ... 中间代码 ...
+    // 如果 panic，_guard 被 drop，GKL.leave() 自动调用
+}  // 正常返回时 _guard 也被 drop
+```
+
+**影响范围**：
+- `Kernel::tick`（行 4824）：调度器时钟滴答，遍历所有缓存链
+- `BlockCache::sync_all`（行 2939）：同步所有缓存链，遍历所有链
+
+**死锁链分析**：
+
+这不是经典的循环等待死锁，而是 **锁泄漏导致的级联死锁**：
+1. Thread A 在 tick 中 panic → GKL 泄漏（永远 held）
+2. Thread B 调用 tick → 等待 GKL → 永远自旋
+3. Thread C 调用 sync_all → 等待 GKL → 永远自旋
+4. 所有需要 GKL 的线程全部卡死 → 系统级死锁
+
+### 测试验证
+
+通过 group_12 中的 12 个并发死锁测试验证：
+- 3 个测试验证真实死锁场景（三方循环等待、GKL↔Sema 反转、COW 故障+GKL 压力）
+- 9 个测试验证修复后不死锁（framepool+cache、syncqueue+channel、内核子系统、reentrant GKL、mount+cache+frame、task fork、futex+sema、disk journal、系统压力）
+- 全部 51 个测试通过（33 原始 + 6 死锁 + 12 group_12）
