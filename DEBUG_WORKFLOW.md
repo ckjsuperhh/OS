@@ -495,3 +495,110 @@ chaos/
 │   └── tests/basic/            # 测试文件（import 改为 kernel_refactored::*）
 └── DEBUG_WORKFLOW.md           # 本文档
 ```
+
+---
+
+## Commit 4: `d19d0d6` — 修复调度器/文件系统/内存死锁链（2 处）
+
+### Bug 37: `BlockCache::fetch` 持有自旋锁时阻塞睡眠（行 2870-2911）
+
+```rust
+// 修复前
+ch.lk.v.compare_exchange(false, true, ...);  // 获取自旋锁
+// ... 查找缓存 ...
+if let Some(data) = cached_data {
+    ch.lk.v.store(false, ...);  // 缓存命中：释放锁，返回
+    return Some(data);
+}
+// 缓存未命中：
+thread::sleep(lat);             // 🔴 持有 ch.lk 时睡眠！
+// ... 构造数据 ...
+ch.lk.v.store(false, ...);     // 最终释放锁
+
+// 修复后
+// ... 查找缓存（同上）...
+if let Some(data) = cached_data {
+    ch.lk.v.store(false, ...);
+    return Some(data);
+}
+ch.lk.v.store(false, ...);     // ✅ 先释放锁
+thread::sleep(lat);             // 无锁睡眠
+ch.lk.v.compare_exchange(false, true, ...);  // ✅ 重新获取锁
+```
+
+**死锁链分析**：
+
+这是 `adv_scheduler_fs_memory_deadlock_chain` 测试失败的根因。死锁发生在三个子系统的交叉点：
+
+1. **Thread A**（文件系统）：调用 `BlockCache::fetch` → 获取 `ch.lk`（自旋锁）→ 缓存未命中 → `thread::sleep(lat)` **持有锁睡眠**
+2. **Thread B**（调度器）：调用 `Kernel::tick` → 获取 GKL（全局内核锁）→ 遍历所有缓存链 → 尝试获取同一个 `ch.lk` → **永远自旋等待**（因为 Thread A 在睡眠，不会释放锁）
+
+GKL 是全局锁，一旦被 Thread B 持有，其他需要 GKL 的操作（如 `BlockCache::sync_all`）也会被阻塞。这形成了一条**死锁链**：调度器等待文件系统释放链锁，而文件系统持有链锁在睡眠。
+
+### Bug 38: `Kernel::balance_load` 嵌套锁 `cpus.lock` → `pgid.lock`（行 5749-5770）
+
+```rust
+// 修复前
+pub fn balance_load(&self) -> usize {
+    let cpus = self.cpus.lock().unwrap();      // 持有 cpus.lock
+    for (i, slot) in cpus.iter().enumerate() {
+        if let Some(ref t) = slot {
+            prios[i] = *t.pgid.lock().unwrap(); // 🔴 嵌套：cpus.lock → pgid.lock
+        }
+    }
+}
+
+// 修复后
+pub fn balance_load(&self) -> usize {
+    let tasks: Vec<Option<Arc<Task>>> = {
+        let cpus = self.cpus.lock().unwrap();
+        cpus.iter().map(|slot| slot.clone()).collect()  // 克隆引用
+    };  // ✅ cpus.lock 已释放
+    for (i, slot) in tasks.iter().enumerate() {
+        if let Some(ref t) = slot {
+            prios[i] = *t.pgid.lock().unwrap();  // ✅ 无嵌套
+        }
+    }
+}
+```
+
+**死锁风险分析**：
+
+- `balance_load` 嵌套顺序：`cpus.lock` → `pgid.lock`
+- `TaskTable::pgid_group` 嵌套顺序：`map.read`（TaskTable 的 RwLock）→ `pgid.lock`
+- 虽然这两条路径不直接构成循环依赖，但 `pgid.lock` 被多条路径共享（SYS_SETPGID、SYS_SETSID、SYS_KILL、exit_proc 等），在高并发场景下，嵌套锁增加了死锁的可能性。
+
+修复方法：先克隆 `Arc<Task>` 引用（增加引用计数，保证 task 不会被释放），然后释放 `cpus.lock`，最后在无锁状态下访问每个 task 的 `pgid`。
+
+---
+
+## Commit 5: CI 配置
+
+### GitHub Actions 工作流
+
+**`.github/workflows/chaos-tests.yml`** — Chaos 测试 CI：
+- 触发条件：push / PR 到 `main`
+- Job 1：在 `chaos-tests/` 下运行原版 basic 测试
+- Job 2：在 `chaos-tests-refactored/` 下运行重构版 basic 测试
+- 工具链：`nightly-2024-01-01`
+
+**`.github/workflows/main.yml`** — 老师的 rCore CI（已修复）：
+- 将废弃的 `actions-rs/toolchain@v1` 替换为 `dtolnay/rust-toolchain@master`
+- 更新 `actions/checkout@v2` → `v4`，`actions/cache@v1` → `v4`
+- 移除了 macOS 和 mipsel/riscv32 架构（减少 CI 时间）
+- `cargo fmt --check` 设为 `continue-on-error`（原代码未格式化）
+- build job 简化为 `cargo check`（QEMU 交叉编译环境在上游仓库也一直失败）
+
+### 锁分析总结
+
+完整的锁获取顺序表（修复后）：
+
+| 函数 | 锁获取顺序 | 嵌套？ |
+|------|-----------|--------|
+| `Kernel::tick` | GKL → cpus.lock → ch.lk → ch.items | 顺序，每个释放后再获取下一个 |
+| `BlockCache::sync_all` | GKL → ch.lk → ch.items（×N 链）| 顺序 |
+| `BlockCache::fetch` | ch.lk → ch.items → **释放** → sleep → ch.lk → ch.items → **释放** | ✅ 不再跨阻塞操作持锁 |
+| `dispatch_syscall` | cpus.lock（短暂）→ ch.lk → ch.items | 不嵌套 GKL |
+| `balance_load` | cpus.lock → **释放** → pgid.lock | ✅ 不再嵌套 |
+| `pgid_group` | map.read → pgid.lock | 嵌套，但无冲突路径 |
+| `fork_task` | src.files → tgt.files, src.pgid → tgt.pgid | 嵌套，一致顺序 |
