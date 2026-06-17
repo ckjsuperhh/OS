@@ -1891,10 +1891,11 @@ impl FHandle {
         Ok(n)
     }
     pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
-        let off = {
+        let (is_append, cur_off) = {
             let d = self.desc.read().unwrap();
-            if d.opt.ap { self.data.lock().unwrap().len() as u64 } else { d.off }
-        } as usize;
+            (d.opt.ap, d.off)
+        };
+        let off = if is_append { self.data.lock().unwrap().len() as u64 } else { cur_off } as usize;
         let len = self.write_at(off, buf)?;
         self.desc.write().unwrap().off += len as u64;
         Ok(len)
@@ -1907,10 +1908,14 @@ impl FHandle {
         Ok(buf.len())
     }
     pub fn seek(&self, pos: FSeek) -> Result<u64, &'static str> {
+        let data_len = match pos {
+            FSeek::End(_) => self.data.lock().unwrap().len() as i64,
+            _ => 0,
+        };
         let mut d = self.desc.write().unwrap();
         d.off = match pos {
             FSeek::Start(o) => o,
-            FSeek::End(o) => (self.data.lock().unwrap().len() as i64 + o) as u64,
+            FSeek::End(o) => (data_len + o) as u64,
             FSeek::Cur(o) => (d.off as i64 + o) as u64,
         };
         Ok(d.off)
@@ -2138,16 +2143,16 @@ impl FLike {
         if buf.is_empty() { return Ok(0); }
         match self {
             FLike::File(f) => {
-                let (off, is_append) = {
+                let (can_wr, is_append, cur_off) = {
                     let desc = f.desc.read().unwrap();
-                    if !desc.opt.wr { return Err("ebadf"); }
-                    let o = if desc.opt.ap {
-                        f.data.lock().unwrap().len() as u64
-                    } else {
-                        desc.off
-                    };
-                    (o as usize, desc.opt.ap)
+                    (desc.opt.wr, desc.opt.ap, desc.off)
                 };
+                if !can_wr { return Err("ebadf"); }
+                let off = if is_append {
+                    f.data.lock().unwrap().len() as u64
+                } else {
+                    cur_off
+                } as usize;
                 let mut d = f.data.lock().unwrap();
                 let end = off + buf.len();
                 if end > d.len() {
@@ -4479,8 +4484,8 @@ impl Task {
         self.info.lock().unwrap().status = Some((code & 0xFF) as i32);
     }
     pub fn exited(&self) -> bool {
-        let t = self.threads.lock().unwrap();
-        t.is_empty() || self.info.lock().unwrap().status.is_some()
+        let empty = self.threads.lock().unwrap().is_empty();
+        empty || self.info.lock().unwrap().status.is_some()
     }
     pub fn get_ep_mut(&self, fd: usize) -> Result<EpInst, &'static str> {
         let ep = self.ep_inst.lock().unwrap();
@@ -4516,9 +4521,9 @@ impl Task {
         *g = Some(cx);
     }
     pub fn has_sig(&self) -> bool {
+        let sm = *self.sig_mask.lock().unwrap();
         let sq = self.sig_queue.lock().unwrap();
         if sq.is_empty() { return false; }
-        let sm = *self.sig_mask.lock().unwrap();
         let tid = self.id();
         let mut found = false;
         for (sig, sender) in sq.iter() {
@@ -4635,14 +4640,12 @@ impl TaskTable {
         self.map.read().unwrap().values().filter(|t| t.tag() == tag).cloned().collect()
     }
     pub fn process_of_tid(&self, tid: usize) -> Option<Arc<Task>> {
-        self.map.read().unwrap().values()
-            .find(|t| t.threads.lock().unwrap().contains(&tid))
-            .cloned()
+        let tasks: Vec<Arc<Task>> = self.map.read().unwrap().values().cloned().collect();
+        tasks.into_iter().find(|t| t.threads.lock().unwrap().contains(&tid))
     }
     pub fn pgid_group(&self, pgid: Pgid) -> Vec<Arc<Task>> {
-        self.map.read().unwrap().values()
-            .filter(|t| *t.pgid.lock().unwrap() == pgid)
-            .cloned().collect()
+        let tasks: Vec<Arc<Task>> = self.map.read().unwrap().values().cloned().collect();
+        tasks.into_iter().filter(|t| *t.pgid.lock().unwrap() == pgid).collect()
     }
     pub fn register(&self, task: &Arc<Task>, pid: Pid) {
         *task.pid.lock().unwrap() = pid.clone();
@@ -5313,7 +5316,12 @@ impl Kernel {
                         let init = self.tasks.find(1);
                         if let Some(ref init_task) = init {
                             *child.parent.lock().unwrap() = Some(init_task.clone());
-                            init_task.subtasks.lock().unwrap().push(child);
+                        }
+                    }
+                    if let Some(ref init_task) = self.tasks.find(1) {
+                        let mut subs = init_task.subtasks.lock().unwrap();
+                        for child in t.subtasks.lock().unwrap().iter() {
+                            subs.push(child.clone());
                         }
                     }
                 }
@@ -5888,9 +5896,9 @@ impl Kernel {
         let parent_vm_token = parent.vm_token.load(Ordering::Relaxed);
         child.vm_token.store(parent_vm_token, Ordering::Relaxed);
         let _est_pages = {
-            let files = parent.files.lock().unwrap();
+            let file_list: Vec<FLike> = parent.files.lock().unwrap().values().cloned().collect();
             let mut total = 0usize;
-            for (_, fl) in files.iter() {
+            for fl in &file_list {
                 match fl {
                     FLike::File(fh) => {
                         total += fh.data.lock().unwrap().len() / PAGE_SZ + 1;
