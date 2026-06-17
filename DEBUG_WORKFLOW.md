@@ -602,3 +602,88 @@ pub fn balance_load(&self) -> usize {
 | `balance_load` | cpus.lock → **释放** → pgid.lock | ✅ 不再嵌套 |
 | `pgid_group` | map.read → pgid.lock | 嵌套，但无冲突路径 |
 | `fork_task` | src.files → tgt.files, src.pgid → tgt.pgid | 嵌套，一致顺序 |
+| `fork_task` (sem/shm) | src.sem_ctx → **释放** → tgt.sem_ctx | ✅ 不再嵌套 |
+| `do_wait` | child.pgid → **释放** → parent.pgid | ✅ 不再嵌套 |
+| `exit_proc` | self.parent → **释放** → parent.ev | ✅ 不再嵌套 |
+
+---
+
+## Commit 6: `fbf67c5` — 消除 fork/wait/exit 中的嵌套锁死锁（3 处）
+
+### Bug 39: `TaskTable::fork_task` 中 `sem_ctx`/`shm_ctx` 嵌套锁（行 4696-4697）
+
+```rust
+// 修复前：同一表达式中同时持有 tgt 和 src 的锁
+*tgt.sem_ctx.lock().unwrap() = src.sem_ctx.lock().unwrap().clone();
+*tgt.shm_ctx.lock().unwrap() = src.shm_ctx.lock().unwrap().clone();
+
+// 修复后：先克隆到局部变量，再赋值
+let sem_clone = src.sem_ctx.lock().unwrap().clone();
+*tgt.sem_ctx.lock().unwrap() = sem_clone;
+let shm_clone = src.shm_ctx.lock().unwrap().clone();
+*tgt.shm_ctx.lock().unwrap() = shm_clone;
+```
+
+**死锁场景**：
+
+Rust 中 `*a.lock() = b.lock().clone()` 会同时持有两个 MutexGuard 直到语句结束。当两个 `fork_task` 并发执行时：
+
+- **Thread 1** fork A→B：持有 `B.sem_ctx`，等待 `A.sem_ctx`
+- **Thread 2** fork B→C：持有 `C.sem_ctx`，等待 `B.sem_ctx`
+
+如果 B.sem_ctx 被 Thread 1 持有，Thread 2 就会等待 Thread 1 释放，而 Thread 1 可能在等待另一个被 Thread 2 间接持有的锁，形成**链式死锁**。
+
+### Bug 40: `Kernel::do_wait` 中 `child.pgid`/`parent.pgid` 嵌套锁（行 5958）
+
+```rust
+// 修复前：== 运算符两侧各创建一个 MutexGuard，同时持有
+0 => *child.pgid.lock().unwrap() == *parent.pgid.lock().unwrap(),
+
+// 修复后：分别读取到局部变量后比较
+0 => {
+    let child_pgid = *child.pgid.lock().unwrap();
+    let parent_pgid = *parent.pgid.lock().unwrap();
+    child_pgid == parent_pgid
+},
+```
+
+**死锁场景**：Rust 表达式中的临时变量（MutexGuard）存活到语句结束。`*a.lock() == *b.lock()` 会先获取 `a` 的锁，再获取 `b` 的锁，两个锁同时持有。如果另一个线程以相反顺序比较同一对 task 的 pgid，即 AB-BA 死锁。
+
+### Bug 41: `Task::exit_proc` 中 `self.parent` → `parent.ev` 嵌套锁（行 4463-4471）
+
+```rust
+// 修复前：持有 self.parent 锁时获取 parent.ev
+let pg = self.parent.lock().unwrap();
+if let Some(ref p) = *pg {
+    let mut pbus = p.ev.lock().unwrap();  // 🔴 嵌套
+    ...
+}
+
+// 修复后：先克隆 parent Arc，释放 self.parent，再获取 parent.ev
+let parent_ref = {
+    let pg = self.parent.lock().unwrap();
+    pg.clone()  // 克隆 Arc，增加引用计数
+};  // self.parent 锁已释放
+if let Some(ref p) = parent_ref {
+    let mut pbus = p.ev.lock().unwrap();  // ✅ 无嵌套
+    ...
+}
+```
+
+**死锁场景**：如果子进程退出时持有 `self.parent` 并尝试获取 `parent.ev`，同时父进程正在处理信号（`send_sig` 持有 `self.sig_queue` → `self.ev`），虽然不直接冲突，但在复杂的进程树中可能形成间接循环依赖。消除嵌套是最安全的做法。
+
+### 通用原则
+
+这三个 bug 的共同模式是 **Rust 表达式中多个 `.lock()` 同时存活**：
+
+```rust
+// 危险：两个 MutexGuard 同时存在
+*a.lock() = b.lock().clone();
+*a.lock() == *b.lock();
+
+// 安全：分步操作
+let tmp = b.lock().unwrap().clone();  // Guard 在这里 drop
+*a.lock() = tmp;                      // 新的 Guard，不与上面的重叠
+```
+
+在 Rust 中，临时变量的生命周期延续到**包含它的最内层语句结束**。这意味着一行代码中的多个 `.lock()` 调用会产生同时持有的锁，即使代码看起来是"顺序执行"的。
