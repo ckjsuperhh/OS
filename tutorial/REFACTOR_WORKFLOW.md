@@ -18,7 +18,7 @@
 
 | 模块 | 文件 | 状态 |
 |---|---|---|
-| Channel | `channel.rs` | CircBuf 和 Channel 已完成重构；Session 2（BUG-06 API 委托）已完成 |
+| Channel | `channel.rs` | CircBuf 和 Channel 已完成重构；Session 2（BUG-06 API 委托）已完成；Session 3（BUG-07 关闭检查）已完成 |
 
 ---
 
@@ -87,6 +87,25 @@
   - `depth()` 的直接读 n → `ring.len()`
   - `remaining_capacity()` 的直接算 `cap - n` → `ring.remaining()`
 - **效果**: Channel 不再直接访问 ring 的任何内部字段（rd/wr/data/cap/n），所有缓冲区操作完全委托给 CircBuf 的公开 API。代码量减少约 30 行。
+
+#### 验证结果
+- 所有 33 个 basic 测试通过
+
+---
+
+### Session 3: channel.rs — send/send_batch 增加通道关闭状态前置检查
+
+**Date**: 2026-06-29
+**Module**: channel.rs
+**Trigger**: 代码审阅中发现 send() 和 send_batch() 在通道已被 close() 关闭后仍尝试写入缓冲区，违反关闭语义
+
+---
+
+#### BUG-07: send() / send_batch() 未检查通道关闭状态
+
+- **问题**: `send()` 和 `send_batch()` 在通道已被 `close()` 关闭后仍会尝试写入缓冲区。虽然不会导致数据损坏，但违反了"关闭即停止写入"的语义契约。生产者应该在关闭后立即得到失败反馈，而不是继续写入。
+- **修复**: `send()` 入口增加 `if self.is_closed() { return false }`，`send_batch()` 入口增加 `if self.is_closed() { return 0 }`。
+- **影响**: Channel::send, Channel::send_batch
 
 #### 验证结果
 - 所有 33 个 basic 测试通过

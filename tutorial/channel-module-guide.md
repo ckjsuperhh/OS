@@ -485,7 +485,7 @@ send: buf(Mutex) → wq(Mutex)
 
 ## 八、Debug 修正记录
 
-以下记录了开发过程中发现并修复的 6 个 Bug，均与指针语义、边界检查和 API 委托有关。
+以下记录了开发过程中发现并修复的 7 个 Bug，均与指针语义、边界检查、API 委托和关闭语义有关。
 
 ### BUG-01：`push` 先移动指针再写入导致 off-by-one
 
@@ -543,3 +543,13 @@ send: buf(Mutex) → wq(Mutex)
 - `remaining_capacity()` 的直接算 `cap - n` → `ring.remaining()`
 
 **效果：** 消除 DRY 违规，Channel 不再直接触碰 ring 内部实现。代码量减少约 30 行。
+
+### BUG-07：send/send_batch 未检查通道关闭状态 → 增加 is_closed() 前置检查
+
+**现象：** close() 后 send() 仍可写入缓冲区，违反关闭契约。生产者在通道关闭后未立即得到失败反馈，而是继续写入缓冲区。
+
+**根因：** `send()` 和 `send_batch()` 入口处未检查 `shut` 标志，即使 `close()` 已将 `shut` 设为 `true`，写入操作仍照常执行。虽然不会导致数据损坏，但违反了"关闭即停止写入"的语义契约。
+
+**修复：** `send()` 入口增加 `if self.is_closed() { return false }`，`send_batch()` 入口增加 `if self.is_closed() { return 0 }`。
+
+**效果：** 关闭后生产者立即得到失败反馈，不再写入。

@@ -220,8 +220,9 @@ impl Channel {
     // 假设 100 个读线程同时调用 recv、缓冲区为空，全部进入等待队列 park，当生产者写入 1 字节，所有 100 个线程全部被唤醒，同时争抢 buf.lock()
     // 过程导致大量内核上下文切换、频繁阻塞唤醒，这也就是锁惊群现象，导致 CPU 被塞满。
 
-    /// 非阻塞式发送一个字节。满返回 false，成功返回 true 并唤醒一个等待读者
+    /// 非阻塞式发送一个字节。通道已关闭或满返回 false，成功返回 true 并唤醒一个等待读者
     pub fn send(&self, v: u8) -> bool {
+        if self.is_closed() { return false; }
         let success = {
             let mut ring = self.buf.lock().unwrap();
             ring.push(v)
@@ -255,8 +256,9 @@ impl Channel {
         r
     }
 
-    /// 批量发送：一次写入多个字节，返回实际写入数。写入后唤醒一个读者
+    /// 批量发送：一次写入多个字节，返回实际写入数。通道已关闭返回 0。写入后唤醒一个读者
     pub fn send_batch(&self, data: &[u8]) -> usize {
+        if self.is_closed() { return 0; }
         let mut ring = self.buf.lock().unwrap();
         let mut written = 0;
         for &byte in data {
@@ -314,4 +316,9 @@ impl Channel {
 //   修复：recv/try_recv/drain_all 改用 ring.pop()，send/send_batch 改用 ring.push()，
 //   depth() 改用 ring.len()，remaining_capacity() 改用 ring.remaining()。
 //   消除了所有对 ring 内部字段（rd/wr/data/cap/n）的直接操作。
+//
+// [BUG-07] send() / send_batch() 未检查通道是否已关闭。
+//   close() 设置 shut 标志后，生产者在语义上不应再写入，但原 send() 仍会尝试 push，
+//   虽然不会导致数据损坏（buf 仍有效），但违反了"关闭即停止写入"的契约。
+//   修复：send() 和 send_batch() 入口处增加 `if self.is_closed() { return false/0 }`。
 // ─────────────────────────────────────────────────────────────────
