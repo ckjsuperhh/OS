@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "kernel-refactored",
+    "chaos-tests-refactored",
+]
+resolver = "2"
