@@ -19,6 +19,8 @@
 | 模块 | 文件 | 状态 |
 |---|---|---|
 | Channel | `channel.rs` | CircBuf 和 Channel 已完成重构；Session 2（BUG-06 API 委托）已完成；Session 3（BUG-07 关闭检查）已完成 |
+| Signal | `signal.rs` | Session 4（BUG-08/09/10 信号集合操作优化）已完成 |
+| Sync | `sync.rs` | Session 5（BUG-11 KernLock::leave() 移除无用原子读）已完成 |
 
 ---
 
@@ -108,6 +110,53 @@
 - **影响**: Channel::send, Channel::send_batch
 
 #### 验证结果
+- 所有 33 个 basic 测试通过
+
+---
+
+### Session 4: signal.rs — 信号集合操作优化
+
+**Date**: 2026-06-29
+**Module**: signal.rs
+**Trigger**: 代码审阅中发现 coalesce_pending/deliverable 存在冗余循环，边界检查风格不一致
+
+---
+
+#### BUG-08: coalesce_pending() 冗余循环
+
+- **问题**: 循环逐位复制 `pending & !blocked` 的结果，完全多余
+- **修复**: 直接返回 `self.pending & !self.blocked & !1`
+- **影响**: SigSet::coalesce_pending
+
+#### BUG-09: deliverable() 循环查找 → trailing_zeros()
+
+- **问题**: for 循环从 1 到 NSIG 逐位查找第一个可投递信号，O(n)
+- **修复**: 使用 `u64::trailing_zeros()` 在 O(1) 内定位最低置位
+- **影响**: SigSet::deliverable
+
+#### BUG-10: actions.len() → NSIG 常量统一
+
+- **问题**: get_action/is_ignored/clear_non_caught 用 .len() 做边界检查，与其他方法用 NSIG 不一致
+- **修复**: 统一改用 `signo < NSIG` 或 `1..NSIG as usize`
+- **影响**: SigSet::get_action, SigSet::is_ignored, SigSet::clear_non_caught
+
+#### 验证结果
+
+- 所有 33 个 basic 测试通过
+
+---
+
+### Session 5: sync.rs — KernLock::leave() 移除无用原子读
+
+**Date**: 2026-06-29
+**Module**: sync.rs
+
+#### BUG-11: KernLock::leave() 中 holder 读取未使用
+- 问题：`let h = self.holder.load(Ordering::Relaxed)` 读取后变量 h 从未被引用
+- 修复：删除该行
+
+#### 验证结果
+
 - 所有 33 个 basic 测试通过
 
 ---

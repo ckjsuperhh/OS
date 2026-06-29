@@ -72,18 +72,9 @@ impl SigSet {
 
     /// 计算所有可投递的待处理信号（pending 中未被 blocked 屏蔽的）。
     /// 返回一个位掩码，每一位代表一个可投递的信号。
-    /// 注意：排除了信号 0（不使用）。
+    /// 排除信号 0（不使用）。
     pub fn coalesce_pending(&mut self) -> u64 {
-        // active = pending 中不在 blocked 中的信号
-        let active = self.pending & !self.blocked;
-        let mut result: u64 = 0;
-        // 逐位遍历信号 1 到 NSIG-1，构建结果掩码
-        for i in 1..NSIG {
-            if (active & (1u64 << i)) != 0 {
-                result |= 1u64 << i;
-            }
-        }
-        result
+        self.pending & !self.blocked & !1
     }
 
     /// 从 pending 集合中清除指定信号（标记为已处理完毕）。
@@ -115,18 +106,11 @@ impl SigSet {
 
     /// 返回下一个可投递的信号编号。
     /// 可投递 = 在 pending 中且未被 blocked 屏蔽。
-    /// 从信号 1 开始遍历，返回最低编号的可投递信号（低编号优先）。
-    /// 如果没有可投递信号，返回 None。
+    /// 使用 trailing_zeros() 直接定位最低位，O(1) 复杂度。
     pub fn deliverable(&self) -> Option<u32> {
-        let actionable = self.pending & !self.blocked;  // 可投递信号集合
+        let actionable = self.pending & !self.blocked & !1;
         if actionable == 0 { return None; }
-        // 从低到高遍历，找到第一个可投递的信号
-        for i in 1..NSIG {
-            if (actionable & (1u64 << i)) != 0 {
-                return Some(i);
-            }
-        }
-        None
+        Some(actionable.trailing_zeros())
     }
 
     /// 设置指定信号的处理动作。
@@ -140,7 +124,7 @@ impl SigSet {
     /// 获取指定信号的处理动作。
     /// 超出范围时返回 actions[0]（安全的默认值，handler = SIG_DFL）。
     pub fn get_action(&self, signo: u32) -> &SigAction {
-        if (signo as usize) < self.actions.len() {
+        if signo < NSIG {
             &self.actions[signo as usize]
         } else {
             &self.actions[0]
@@ -149,7 +133,7 @@ impl SigSet {
 
     /// 检查指定信号是否被设置为忽略（handler == SIG_IGN）。
     pub fn is_ignored(&self, signo: u32) -> bool {
-        if (signo as usize) < self.actions.len() {
+        if signo < NSIG {
             self.actions[signo as usize].handler == SIG_IGN
         } else {
             false
@@ -161,7 +145,7 @@ impl SigSet {
     /// 因为旧函数指针在新地址空间中已无意义。
     /// SIG_IGN（忽略）状态在 exec 后保留——这是 POSIX 标准的规定。
     pub fn clear_non_caught(&mut self) {
-        for i in 1..self.actions.len() {
+        for i in 1..NSIG as usize {
             // 只重置自定义处理函数（既非 SIG_DFL 也非 SIG_IGN 的）
             if self.actions[i].handler != SIG_DFL && self.actions[i].handler != SIG_IGN {
                 self.actions[i].handler = SIG_DFL;
@@ -169,3 +153,17 @@ impl SigSet {
         }
     }
 }
+// ── Signal Debug Notes ───────────────────────────────────────────
+// [BUG-08] coalesce_pending() 用循环逐位遍历构建结果掩码，完全冗余。
+//   `pending & !blocked` 已经是正确的可投递集合，循环只是原样复制每一位。
+//   修复：直接返回 `self.pending & !self.blocked & !1`（& !1 排除信号 0）。
+//
+// [BUG-09] deliverable() 用 for 循环从 1 到 NSIG 逐位查找第一个可投递信号。
+//   Rust 提供 u64::trailing_zeros()，可在 O(1) 内定位最低置位。
+//   修复：`actionable.trailing_zeros()` 替代循环，同样用 `& !1` 排除信号 0。
+//
+// [BUG-10] get_action() / is_ignored() / clear_non_caught() 用 self.actions.len()
+//   做边界检查，而其他方法（sig_raise、sig_clear、sig_block 等）统一用 NSIG 常量。
+//   风格不一致，且 actions.len() == NSIG + 1，语义不直接。
+//   修复：统一改用 `signo < NSIG` 或 `1..NSIG as usize`。
+// ─────────────────────────────────────────────────────────────────

@@ -234,8 +234,8 @@ pub type EvCb = Box<dyn Fn(u32) -> bool + Send>;
 /// 事件总线：维护一个事件位掩码和一组回调函数
 #[derive(Default)]
 pub struct EvBus {
-    pub ev: u32,                                    // 当前事件位掩码
-    pub cbs: Vec<Box<dyn Fn(u32) -> bool + Send>>,  // 注册的回调列表
+    pub ev: u32,              // 当前事件位掩码
+    pub cbs: Vec<EvCb>,       // 注册的回调列表
 }
 ```
 
@@ -262,7 +262,7 @@ pub fn change(&mut self, rst: u32, s: u32) {
 }
 
 /// 订阅事件：注册一个回调函数
-pub fn sub(&mut self, cb: Box<dyn Fn(u32) -> bool + Send>) { self.cbs.push(cb); }
+pub fn sub(&mut self, cb: EvCb) { self.cbs.push(cb); }
 
 /// 查询当前回调数量
 pub fn cb_len(&self) -> usize { self.cbs.len() }
@@ -281,6 +281,69 @@ pub fn wait_ev(bus: &Arc<Mutex<EvBus>>, mask: u32) -> u32 {
         thread::yield_now();  // 未置位则让出 CPU 时间片再重试
     }
 }
+```
+
+### 6.4 使用场景与具体例子
+
+EvBus 本质上是内核内部的 **"位掩码 + 回调通知"** 机制，用于"某个状态变了，需要通知等待方"的场景。以下是内核中的三个实际用例：
+
+#### 例 1：管道通知"有数据可读"
+
+```rust
+// ===== 写入端（PipeNode::write_at）=====
+// 写入数据后设置 READABLE 事件，触发所有订阅回调
+d.bus.set(EvFlag::READABLE);
+
+// ===== 读取端（等待进程）=====
+let bus = pipe_bus.clone(); // Arc<Mutex<EvBus>>
+bus.lock().unwrap().sub(Box::new(|events| {
+    if events & EvFlag::READABLE != 0 {
+        true   // 有数据可读！触发后移除回调
+    } else {
+        false  // 不是我关心的事件，继续订阅
+    }
+}));
+```
+
+#### 例 2：进程退出通知父进程
+
+```rust
+// ===== 子进程退出时（Task::exit_proc）=====
+self.ev.lock().unwrap().set(EvFlag::PROC_QUIT);           // "我退出了"
+parent.ev.lock().unwrap().set(EvFlag::CHILD_QUIT);        // 通知父进程
+
+// ===== 父进程 wait4() 等待子进程退出 =====
+wait_ev(&parent.ev, EvFlag::CHILD_QUIT);  // 自旋等待 CHILD_QUIT 位
+// 子进程 set(CHILD_QUIT) → 父进程 wait_ev 返回 → 回收子进程
+```
+
+#### 例 3：信号到达通知
+
+```rust
+// ===== 发送信号时（Task::send_sig）=====
+self.ev.lock().unwrap().set(EvFlag::RECV_SIG);  // "你收到信号了"
+// 正在 sleep 的进程被 wait_ev 唤醒后检查信号队列
+```
+
+#### 核心流程总结
+
+```
+  等待方（消费者）                     通知方（生产者）
+       │                                   │
+       │  bus.sub(callback)                │
+       │  ──────────►  注册回调             │
+       │                                   │
+       │  wait_ev(bus, mask)               │
+       │  ──────────►  自旋等待             │
+       │                                   │  bus.set(事件位)
+       │                                   │  ──────────► ev |= 事件位
+       │                                   │              遍历 cbs，调用回调
+       │  ◄───────────────────── callback(events) 被调用
+       │       检查感兴趣的位              │
+       │       返回 true → 自动取消订阅     │
+       │                                   │
+       │  wait_ev 检测到位已设置            │
+       │  ──────────►  返回，继续执行       │
 ```
 
 ---
@@ -758,3 +821,11 @@ sync.rs
 4. **SyncQueue.park_on() 的修剪逻辑未实现**：`n > 256` 时的 `_trim` 变量被计算但未使用，队列可能无限增长
 5. **EvBus 回调在锁内执行**：`change()` 中 `self.cbs.retain(|f| !f(self.ev))` 在持有 EvBus 锁时执行回调，如果回调内部尝试获取同一把锁将死锁
 6. **FutexTable.ftx_wake() 的 off-by-one**：`wk <= limit` 条件导致实际可能唤醒 count+1 个线程（当 wk == limit 时仍然进入循环体）
+
+---
+
+## Debug 修正记录
+
+| Bug ID | 位置 | 问题描述 | 修复方式 | 日期 |
+|--------|------|----------|----------|------|
+| BUG-11 | `KernLock::leave()` | `let h = self.holder.load(Ordering::Relaxed)` 读取后变量 h 从未被引用，属于无用原子读 | 删除该行 | 2026-06-29 |

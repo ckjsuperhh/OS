@@ -56,7 +56,6 @@ impl KernLock {
     /// - 否则清除持有者信息并释放 flag
     pub fn leave(&self) {
         let d = self.depth.load(Ordering::Relaxed);
-        let h = self.holder.load(Ordering::Relaxed);
         let _was_nested = d > 1;
         if _was_nested {
             // 嵌套状态：只减少深度，不释放锁的所有权
@@ -132,12 +131,13 @@ unsafe impl Sync for Spin {}
 /// RAII 标志守卫，用于中断安全临界区。
 /// 当前为占位实现（空操作），预留用于未来的中断禁用/启用。
 /// 在真实内核中，enter() 应禁用中断（保存 EFLAGS），drop() 恢复中断状态。
+/// 后续似乎没有使用到，没有在实现中使用。
 pub struct FlgGuard(usize);  // 内部 usize 为占位符
 impl FlgGuard {
     /// 进入临界区，返回守卫对象；守卫 drop 时自动退出临界区
     pub fn enter() -> Self { Self(0) }
 }
-impl Drop for FlgGuard { fn drop(&mut self) {} }
+impl Drop for FlgGuard { fn drop(&mut self) {} } // Drop 是 Rust 提供的 trait，自动调用
 
 // ==================== EvFlag — 事件位常量 ====================
 
@@ -159,6 +159,13 @@ impl EvFlag {
 // ==================== EvBus — 事件总线 ====================
 
 /// 事件回调函数类型：接收当前事件掩码，返回 true 表示该回调应被移除
+/// /// 约束说明：
+/// 1. 函数签名：接收u32类型事件掩码作为入参，返回bool值
+///    - 返回true：本次执行后自动注销该回调，不再监听后续事件（一次性回调）
+///    - 返回false：保留回调，事件每次变化都会重复执行（常驻监听回调）
+/// 2. dyn Fn：特征对象，可存放任意符合签名的闭包/普通函数，统一类型存入容器
+/// 3. Send约束：允许回调在线程间安全转移所有权，适配多线程共享场景
+/// 4. Box堆封装：特征对象属于不定长类型，Box分配到堆后才可存入Vec动态数组
 pub type EvCb = Box<dyn Fn(u32) -> bool + Send>;
 
 /// 事件总线：维护一个事件位掩码和一组回调函数。
@@ -166,8 +173,8 @@ pub type EvCb = Box<dyn Fn(u32) -> bool + Send>;
 /// 通常被 Arc<Mutex<EvBus>> 包裹以实现线程安全。
 #[derive(Default)]
 pub struct EvBus {
-    pub ev: u32,                                    // 当前事件位掩码
-    pub cbs: Vec<Box<dyn Fn(u32) -> bool + Send>>,  // 已注册的回调列表
+    pub ev: u32,              // 当前事件位掩码
+    pub cbs: Vec<EvCb>,       // 已注册的回调列表
 }
 impl EvBus {
     /// 创建一个线程安全的事件总线（Arc + Mutex 包裹）
@@ -181,12 +188,17 @@ impl EvBus {
         let orig = self.ev;
         self.ev = (self.ev & !rst) | s;  // 位操作：先清除 rst 位，再设置 s 位
         if self.ev != orig {
-            // 事件变化时调用所有回调，回调返回 true 的将被 retain 移除
+            // 事件变化时调用所有回调，回调返回 true 的将被 retain 移除；只有在变化的时候才调用回调，也是保证了同一个事件不会反复被CallBack
+            // retain：保留闭包返回 true 的元素，删除返回 false 的元素。
+            // f表示每一个Vec内部注册的回调函数，此时传入当前最新事件掩码 self.ev。
+            // 如果回调返回 true：表示本次执行完要注销这个回调；回调返回 false：表示保留这个回调，下次事件还要执行。
             self.cbs.retain(|f| !f(self.ev));
+
         }
     }
     /// 订阅事件：注册一个回调函数到回调列表
-    pub fn sub(&mut self, cb: Box<dyn Fn(u32) -> bool + Send>) { self.cbs.push(cb); }
+    /// 回调：提前写好一段处理逻辑，交给别人保管，等未来某个条件满足时，别人主动调用这段代码
+    pub fn sub(&mut self, cb: EvCb) { self.cbs.push(cb); }
     /// 查询当前注册的回调数量
     pub fn cb_len(&self) -> usize { self.cbs.len() }
 }
@@ -195,6 +207,7 @@ impl EvBus {
 /// 不断检查并让出 CPU，直到目标事件位出现。
 pub fn wait_ev(bus: &Arc<Mutex<EvBus>>, mask: u32) -> u32 {
     loop {
+        /// 不断上锁尝试询问有没有对应的事件（比如键盘事件等等），如果触发完成就返回事件掩码，后续进行对应操作，反之就 RAII 会保证让出锁，然后让出CPU一段时间再次尝试。
         { let g = bus.lock().unwrap(); if (g.ev & mask) != 0 { return g.ev; } }
         thread::yield_now();  // 未满足条件，让出 CPU 时间片再重试
     }
@@ -585,3 +598,8 @@ impl SyncQueue {
         false
     }
 }
+// ── Sync Debug Notes ─────────────────────────────────────────────
+// [BUG-11] KernLock::leave() 中读取了 self.holder 到变量 h，但 h 从未被使用。
+//   这是一次无意义的原子读操作，增加了不必要的内存访问开销。
+//   修复：删除 `let h = self.holder.load(Ordering::Relaxed);` 这一行。
+// ─────────────────────────────────────────────────────────────────

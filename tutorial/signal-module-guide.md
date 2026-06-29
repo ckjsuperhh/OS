@@ -368,3 +368,39 @@ signal.rs
 4. **缺少信号队列**：当前实现中同一信号只保留一个 pending 位，多次 `sig_raise` 同一信号会"合并"为一个。POSIX 的 `sigqueue()` 要求实时信号 (32-64) 排队不丢失
 5. **`get_action()` 的越界处理**：当 `signo` 超出范围时返回 `actions[0]`，但 `actions[0]` 是一个空白的默认动作，语义不够清晰——可以考虑 `panic!` 或返回 `Option`
 6. **线程安全**：`SigSet` 没有任何同步保护，在多核环境下可能存在竞态。如果每个进程只有一个线程访问则无碍，但 `kill()` 可能从其他进程/线程调用
+
+---
+
+## 八、Debug 修正记录
+
+以下记录了代码审阅中发现并修复的 3 个 Bug，均与信号集合操作的性能优化和风格统一有关。
+
+### BUG-08：`coalesce_pending()` 冗余循环 → 直接位运算返回
+
+**现象：** `coalesce_pending()` 先计算 `active = self.pending & !self.blocked`，再用 for 循环逐位将 `active` 中 bit 1..NSIG 复制到 `result`。循环完全是多余的位复制操作。
+
+**根因：** `active` 已经是正确的可投递信号集合（pending 中未被 blocked 屏蔽的），循环只是将同样的位从一个 `u64` 复制到另一个 `u64`，唯一的差异是跳过了 bit 0 和 bit 63（NSIG）。由于信号编号从 1 开始，bit 0 本就不应出现，直接 `& !1` 即可排除。
+
+**修复：** 将循环整体替换为 `return self.pending & !self.blocked & !1`，一行完成计算。
+
+**效果：** 消除 63 次循环迭代，代码从 10 行缩减为 1 行，语义更清晰。
+
+### BUG-09：`deliverable()` 循环查找 → `trailing_zeros()` O(1) 定位
+
+**现象：** `deliverable()` 使用 `for i in 1..NSIG` 逐位检查 `actionable & (1u64 << i)` 是否为 0，以找到最低编号的可投递信号。最坏情况需遍历 NSIG-1 次。
+
+**根因：** 查找最低置位（lowest set bit）是 `u64::trailing_zeros()` 的原生能力——它直接返回最低位 1 的位置，等价于循环查找的结果但只需一条 CPU 指令（`tzcnt`/`bsf`）。
+
+**修复：** 将 for 循环替换为 `let sig = actionable.trailing_zeros(); return Some(sig)`，并移除 `actionable == 0` 的提前检查（`trailing_zeros()` 在输入为 0 时返回 64，可通过 `sig < NSIG` 统一处理）。
+
+**效果：** 从 O(n) 循环降为 O(1) 位运算，代码更简洁。
+
+### BUG-10：`get_action`/`is_ignored`/`clear_non_caught` 边界检查用 `.len()` → 统一为 `NSIG`
+
+**现象：** `set_action()` 使用 `signo < NSIG` 做边界检查，而 `get_action()`、`is_ignored()` 使用 `(signo as usize) < self.actions.len()`，`clear_non_caught()` 使用 `1..self.actions.len()` 做循环范围。两种风格混用，不一致且 `.len()` 依赖 Vec 容量而非信号语义常量。
+
+**根因：** 由于 `actions` 在 `new()` 中按 `NSIG + 1` 初始化，`actions.len()` 始终等于 `NSIG + 1`，因此 `signo < actions.len()` 允许 `signo == NSIG`（越界信号），而 `set_action()` 的 `signo < NSIG` 则不允许。语义上应统一以 `NSIG` 为界。
+
+**修复：** `get_action()` 和 `is_ignored()` 改为 `signo < NSIG`，`clear_non_caught()` 改为 `1..NSIG as usize`。
+
+**效果：** 所有方法的边界检查统一使用 `NSIG` 常量，语义清晰且与 `set_action()`、`sig_raise()`、`sig_clear()` 保持一致。
