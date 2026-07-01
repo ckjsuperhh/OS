@@ -36,7 +36,7 @@ pub struct Kernel {
     pub pool: FramePool,                                       // 物理页帧池：管理物理内存分配
     pub cpus: Mutex<[Option<Arc<Task>>; MAX_CPU]>,             // CPU 槽位数组：每个 CPU 当前运行的任务
     pub mnt: MountTable,                                       // 挂载表：文件系统挂载点管理
-    pub configfs: ConfigFS,                                    // configFS 配置伪文件系统
+    pub configfs: ConfigFS,                                    // configFS 配置伪文件系统 [BUG-20]
     pub sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,        // 信号量存储：key -> 信号量数组（弱引用）
     pub shm_store: RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>, // 共享内存存储：key -> 共享内存页（弱引用）
     pub tty_buf: Mutex<VecDeque<u8>>,                          // TTY 输入缓冲区
@@ -63,6 +63,7 @@ impl Kernel {
     /// 2. 统计 CPU 占用率
     /// 3. 刷新块缓存（清除脏标志）
     /// 4. 释放全局内核锁
+    // [BUG-19] 使用 GKL.enter/leave 替换手动 holder/depth/flag 原子序列
     pub fn tick(&self, id: usize) {
         GKL.enter(id);
         // 统计 CPU 占用率：计算空闲 CPU 百分比
@@ -161,7 +162,7 @@ impl Kernel {
         root.threads.lock().unwrap().push(rid);
         let _kstk = KStk::new();
         *root.kstk.lock().unwrap() = Some(_kstk);
-        // 挂载 configFS 并注册 demo 子系统
+        // 挂载 configFS 并注册 demo 子系统 [BUG-20]
         self.mnt.bind("/config", "configfs");
         self.configfs.register_subsystem(demo_config_subsystem());
     }
@@ -323,7 +324,7 @@ impl Kernel {
                 // 使用路径字符串占位（真实系统需从用户空间拷贝）
                 let path = format!("/config/path_{}", path_addr);
                 let resolved = self.lookup_path(&path).unwrap_or_else(|_| path.clone());
-                // configFS 路径处理：configfs:subsys/.../item/attr
+                // configFS 路径处理：configfs:subsys/.../item/attr [BUG-20]
                 if resolved.starts_with("configfs:") {
                     let sub_path = &resolved["configfs:".len()..];
                     if let Ok(ConfigLookup::Attr(item, attr_name)) = self.configfs.lookup(sub_path) {
@@ -1424,7 +1425,7 @@ impl Kernel {
     }
 }
 
-/// 创建 configFS demo 子系统：counter
+/// 创建 configFS demo 子系统：counter [BUG-20]
 /// 用户可在 /config/demo 下 mkdir 创建计数器 item，读写 value 属性
 pub fn demo_config_subsystem() -> ConfigSubsystem {
     fn demo_show(item: &ConfigItem) -> String {

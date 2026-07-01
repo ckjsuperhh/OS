@@ -25,7 +25,7 @@ use crate::sync::{Spin, SyncQueue, EvBus, EvFlag, EvCb, GKL};
 use crate::channel::CircBuf;
 use crate::util::CLK;
 
-// ==================== configFS 伪文件系统 ====================
+// ==================== configFS 伪文件系统 ==================== [BUG-20]
 
 /// configFS 属性描述：名称、权限、读写回调
 pub struct ConfigAttr {
@@ -601,6 +601,7 @@ impl PipeNode {
 
 /// FLike 是内核中的 VFS（虚拟文件系统）层
 /// 每个文件描述符都存储为 FLike，读写时通过 match 分发到对应实现
+/// [BUG-20] 新增 Config 分支以支持 configFS 属性文件
 #[derive(Clone)]
 pub enum FLike {
     File(FHandle),      // 普通文件
@@ -741,6 +742,7 @@ impl FLike {
     }
 
     /// ioctl 分发：将设备控制命令转发到对应的底层实现
+    /// ioctl(IO control)：设备 / 特殊资源的配置、查询、开关、控制命令，比如改非阻塞、获取终端尺寸、网卡配置、设置缓冲区大小、锁文件
     pub fn io_ctl(&self, req: usize, a1: usize) -> Result<usize, &'static str> {
         match self {
             FLike::File(f) => {
@@ -762,6 +764,7 @@ impl FLike {
     }
 
     /// 内存映射：仅普通文件支持 mmap
+    /// 把文件的一段内容，直接映射到进程虚拟地址空间里一块内存区间。程序像读写普通数组一样读写文件，不用 read/write；CPU 缺页时内核自动加载磁盘数据，修改后内核自动回写。
     pub fn mmap_fl(&self, start: usize, end: usize, off: usize) -> Result<(), &'static str> {
         if start >= end { return Err("einval"); }
         let _pages = (end - start + PAGE_SZ - 1) / PAGE_SZ;
@@ -857,6 +860,7 @@ pub fn read_as_vec(data: &[u8]) -> Vec<u8> { data.to_vec() }
 
 // ==================== Epoll 事件多路复性子系统 ====================
 
+// IO 多路复用工具：一个进程可以同时监听成千上万个 fd（文件、管道、socket），哪个 fd 有可读 / 可写 / 异常事件，内核就主动通知进程，不用循环挨个轮询所有 fd，大幅节省 CPU。
 /// epoll 用户数据（通常存放 fd 或自定义指针）
 #[derive(Clone, Copy)]
 pub struct EpData { pub ptr: u64 }
@@ -1000,7 +1004,7 @@ pub struct PageCache {
     pub capacity: usize,                          // 最大缓存页数
     pub hits: AtomicUsize,                        // 缓存命中计数
     pub misses: AtomicUsize,                      // 缓存未命中计数
-    pub evictions: AtomicUsize,                   // 驱逐计数
+    pub evictions: AtomicUsize,                   // 驱逐计数,淘汰页面总次数
     pub lru_order: VecDeque<usize>,               // LRU 顺序（队头最旧，队尾最新）
 }
 
@@ -1079,7 +1083,7 @@ impl PageCache {
         }
     }
 
-    /// 写回所有脏页并清除脏标志，返回写回的页数
+    /// 写回所有脏页并清除脏标志，返回写回的页数（没有磁盘当然没有写写回）
     pub fn writeback_all(&mut self) -> usize {
         let mut count = 0;
         for (_, e) in self.entries.iter_mut() {
@@ -1152,6 +1156,8 @@ impl PageCache {
 // ==================== 内核对象注册表 ====================
 
 /// 内核对象条目：追踪一个内核对象的元信息
+/// 记录内核所有资源对象：管道、epoll、信号量、共享内存、打开文件、设备、线程等。
+/// 给每一类内核资源分配全局唯一 ID；记录归属进程、父子层级、引用计数；支持按类型 / 进程快速检索资源；自动垃圾回收 GC：没人用（ref_count=0）的资源统一清理；导出对象依赖关系图，方便调试内核泄露。
 pub struct KObjEntry {
     pub obj_id: usize,          // 对象 ID（全局唯一，递增分配）
     pub type_tag: u32,          // 类型标签（区分文件/管道/信号量等不同类型）
@@ -1511,7 +1517,7 @@ impl BlockCache {
 }
 
 // ==================== 挂载表 ====================
-
+/// VFS 路径解析核心层，实现多文件系统挂载、最长前缀匹配，把用户字符串路径翻译成「设备 + 子路径」
 /// 挂载条目：一个挂载点前缀到目标设备的映射
 #[derive(Clone, Debug)]
 pub struct MountEntry {
@@ -1667,6 +1673,9 @@ impl MountTable {
 // ==================== I/O 调度队列（SCAN 电梯算法） ====================
 
 /// I/O 请求：描述一次磁盘块读写操作
+/// 磁盘机械寻道很慢，不能按提交顺序读写。
+/// 电梯 SCAN 算法：磁头单向扫，到头掉头，优先处理同方向近的块；同时合并相邻 IO，大幅减少磁头来回移动耗时。
+/// 属于文件系统横向底层子系统，BlockCache 缺页、刷脏块时提交 IO 到此队列。
 pub struct IoRequest {
     pub block: usize,           // 目标块号
     pub write: bool,            // 是否为写操作

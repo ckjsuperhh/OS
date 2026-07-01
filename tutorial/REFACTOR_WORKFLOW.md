@@ -24,6 +24,8 @@
 | Ipc | `ipc.rs` | Session 7（BUG-15 SemArr otime/ctime 改为真实 Unix 时间戳）已完成 |
 | Trap | `trap.rs` | Session 8（BUG-16 死代码清理 + 删除 handle_irq + dispatch 对标标准两层 trap 范式重写）已完成 |
 | Util | `util.rs` | Session 9（BUG-17 check_access_rw 三层校验实现 + cfu 死代码清理）已完成 |
+| Kernel | `kernel.rs` | Session 10（BUG-19 tick() 手动 GKL 原子操作替换为 enter/leave）已完成 |
+| FS | `fs.rs` | Session 11（新增 configFS 伪文件系统 + FLike::Config + demo 子系统）已完成 |
 
 ---
 
@@ -307,6 +309,77 @@
 
 - **验证**：33/33 测试全过。
 - 详见 `util.rs` 中 `ctu()` 后的 `[BUG-17]` 注释块。
+
+---
+
+## Session 10 — tick() 手动 GKL 原子操作替换为 enter/leave
+
+**Date**: 2026-07-02
+**Module**: `kernel.rs`
+
+#### BUG-19: tick() 手动维护 GKL 原子字段 → 使用 KernLock 封装接口（已修复）
+
+- **问题**：`tick()` 中手动操作 `GKL.holder`、`GKL.depth`、`GKL.flag` 三个原子变量来实现进入/离开全局内核锁，代码冗长且与 `KernLock` 已提供的 `enter(id)` / `leave()` 语义重复。手动实现容易在重入、内存序、状态一致性上出错。
+- **修复**：
+  - 删除手动 `load` / `compare_exchange` / `store` 序列；
+  - `tick()` 开头调用 `GKL.enter(id)`，结尾调用 `GKL.leave()`；
+  - 由 `KernLock` 内部统一处理 holder、depth、flag 的转换与重入计数。
+- **影响**：`Kernel::tick`。
+- **标记**：`kernel.rs` 中 `tick()` 附近标注 `[BUG-19]`。
+
+#### 验证结果
+
+- `cargo test --workspace --test basic` → 33/33 测试全过。
+
+---
+
+## Session 11 — 新增 configFS 伪文件系统
+
+**Date**: 2026-07-02
+**Module**: `fs.rs` / `kernel.rs` / `chaos-tests-refactored`
+
+#### BUG-20: 实现 configFS 伪文件系统（已修复）
+
+- **问题**：内核缺少 Linux 风格的 configFS：用户态无法通过 `mkdir` / `rmdir` 动态创建/销毁内核对象，也缺少基于回调的属性文件读写。`FLike` 只有 `File` / `Pipe` / `Ep`，未覆盖 configFS；`SYS_OPEN` / `SYS_READ` / `SYS_WRITE` 只特殊处理了 fd 0-2，未把真实 fd 路由到任务文件表。
+- **修复**：
+  1. 在 `fs.rs` 新增 configFS 核心结构：
+     - `ConfigAttr`：属性名、权限、`show` / `store` 回调；
+     - `ConfigItemType`：item 类型定义；
+     - `ConfigItem` / `ConfigGroup` / `ConfigChild`：树形目录/条目；
+     - `ConfigSubsystem` / `ConfigFS`：子系统注册与全局管理；
+     - `ConfigLookup` / `ConfigNode`：路径查找结果与可打开的节点，支持 `read` / `write` / `poll` 和读写偏移。
+  2. 实现 `ConfigFS::lookup`、`mkdir`、`rmdir`：
+     - `lookup` 按 `/` 切分路径，沿 group 树找到 item 的属性；
+     - `mkdir` 在指定子系统下创建新 item；
+     - `rmdir` 删除指定 item。
+  3. `FLike` 新增 `Config(ConfigNode)` 分支，并补齐 `dup` / `read` / `write` / `io_ctl` / `mmap_fl` / `poll` / `Debug` 的处理。
+  4. `kernel.rs`：
+     - `Kernel` 增加 `configfs: ConfigFS` 字段并在 `Kernel::new()` 初始化；
+     - `proc_init()` 挂载 `/config` 并注册 `demo_config_subsystem()`；
+     - 新增 `read_fd()` / `write_fd()` 辅助方法，将 fd ≥ 3 的 `SYS_READ` / `SYS_WRITE` 分发到当前任务的文件表；
+     - `SYS_OPEN` 检测 `configfs:...` 路径，创建 `FLike::Config` 并分配 fd。
+  5. `demo_config_subsystem()`：提供 `demo` 子系统与 `counter` 类型，含 `value` 属性（默认 "0"，可读写整数字符串）。
+  6. 为 `fs.rs` 中 `FLike`、epoll、PageCache、KObjEntry、MountTable、IoRequest 等关键子系统补充中文说明注释。
+
+- **关键细节 / 踩坑**：
+  - `ConfigFS::lookup` 中因 `children.lock()` 持有期间再赋值 `current` 导致借用冲突，通过在锁作用域内 clone 出 `ConfigChild` 后在外部 match 解决。
+  - `ConfigNode` 的 `offset` 在一次 `read` 后会推进到末尾，第二次 `read` 前需在测试中重置为 0 才能读到完整新值。
+  - 系统调用测试需先把 root 任务设为 CPU0 当前任务，并预占 fd 0/1/2，确保 config fd ≥ 3 走真实文件表分支。
+
+#### 测试与验证
+
+- 新增 `chaos-tests-refactored/tests/basic/group_12.rs`，包含 3 个带注释的测试：
+  - `configfs_demo_mkdir_read_write`：mkdir 创建 counter，读取默认值 "0"，写入 "42" 后回读。
+  - `configfs_demo_rmdir`：创建后 rmdir 销毁，再次查找失败。
+  - `configfs_via_syscall_open_read_write`：通过 `SYS_OPEN` / `SYS_READ` 走 syscall 路径读取 config 属性。
+- `chaos-tests-refactored/tests/basic/main.rs` 增加 `mod group_12;`。
+- 验证结果：
+  ```bash
+  cargo test --workspace --test basic
+  ```
+  → 36/36 测试全过（33 个原有测试 + 3 个新增 group_12）。
+
+- **标记**：`fs.rs` / `kernel.rs` 中 configFS 相关位置标注 `[BUG-20]`。
 
 ---
 
