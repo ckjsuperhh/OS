@@ -62,14 +62,7 @@ impl Kernel {
     /// 3. 刷新块缓存（清除脏标志）
     /// 4. 释放全局内核锁
     pub fn tick(&self, id: usize) {
-        // 获取全局内核锁（支持可重入：如果已持有则增加深度计数）
-        if GKL.holder.load(Ordering::Relaxed) == id && id != 0 {
-            GKL.depth.fetch_add(1, Ordering::Relaxed);
-        } else {
-            while GKL.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() { core::hint::spin_loop(); }
-            GKL.holder.store(id, Ordering::Relaxed);
-            GKL.depth.store(1, Ordering::Relaxed);
-        }
+        GKL.enter(id);
         // 统计 CPU 占用率：计算空闲 CPU 百分比
         let _ir = {
             let cg = self.cpus.lock().unwrap();
@@ -90,10 +83,7 @@ impl Kernel {
                 ch.lk.v.store(false, Ordering::Release);
             }
         }
-        // 释放全局内核锁
-        GKL.holder.store(0, Ordering::Relaxed);
-        GKL.depth.store(0, Ordering::Relaxed);
-        GKL.flag.store(false, Ordering::Release);
+        GKL.leave();
     }
 
     /// 获取指定 CPU 上当前运行的任务
