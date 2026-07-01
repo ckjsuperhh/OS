@@ -203,21 +203,10 @@ impl Task {
             gaps.len()
         };
         // 阶段 3：触发 PROC_QUIT 事件，唤醒所有等待此进程的线程
-        {
-            let mut bus = self.ev.lock().unwrap();
-            let orig = bus.ev;
-            bus.ev = (bus.ev & !0) | EvFlag::PROC_QUIT;
-            if bus.ev != orig { let ev = bus.ev; bus.cbs.retain(|f| !f(ev)); }
-        }
+        self.ev.lock().unwrap().set(EvFlag::PROC_QUIT);
         // 阶段 4：通知父进程——设置父进程的 CHILD_QUIT 事件
-        {
-            let pg = self.parent.lock().unwrap();
-            if let Some(ref p) = *pg {
-                let mut pbus = p.ev.lock().unwrap();
-                let orig = pbus.ev;
-                pbus.ev |= EvFlag::CHILD_QUIT;
-                if pbus.ev != orig { let ev = pbus.ev; pbus.cbs.retain(|f| !f(ev)); }
-            }
+        if let Some(ref p) = *self.parent.lock().unwrap() {
+            p.ev.lock().unwrap().set(EvFlag::CHILD_QUIT);
         }
         // 阶段 5：记录退出码（低 8 位为退出状态）
         let mut ec = self.exit_code.lock().unwrap();
@@ -311,10 +300,7 @@ impl Task {
         sq.push_back((signo, sender_tid));
         drop(sq);
         // 触发信号接收事件
-        let mut bus = self.ev.lock().unwrap();
-        let o = bus.ev;
-        bus.ev |= EvFlag::RECV_SIG;
-        if bus.ev != o { let ev = bus.ev; bus.cbs.retain(|f| !f(ev)); }
+        self.ev.lock().unwrap().set(EvFlag::RECV_SIG);
     }
 
     // ==================== 文件描述符操作 ====================

@@ -453,9 +453,7 @@ impl FLike {
                 }
                 // 读完后如果缓冲区空了，清除可读事件并触发回调
                 if d.buf.is_empty() {
-                    d.bus.ev &= !EvFlag::READABLE;
-                    let ev = d.bus.ev;
-                    d.bus.cbs.retain(|f| !f(ev));
+                    d.bus.clear(EvFlag::READABLE);
                 }
                 Ok(take)
             }
@@ -501,10 +499,7 @@ impl FLike {
                     written += 1;
                 }
                 if written > 0 {
-                    let orig = d.bus.ev;
-                    d.bus.ev |= EvFlag::READABLE;  // 设置可读标志
-                    // 事件状态变化时触发回调（通知等待的读者）
-                    if d.bus.ev != orig { let ev = d.bus.ev; d.bus.cbs.retain(|f| !f(ev)); }
+                    d.bus.set(EvFlag::READABLE);
                 }
                 Ok(written)
             }
