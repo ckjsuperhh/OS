@@ -20,7 +20,7 @@
 |---|---|---|
 | Channel | `channel.rs` | CircBuf 和 Channel 已完成重构；Session 2（BUG-06 API 委托）已完成；Session 3（BUG-07 关闭检查）已完成 |
 | Signal | `signal.rs` | Session 4（BUG-08/09/10 信号集合操作优化）已完成 |
-| Sync | `sync.rs` | Session 5（BUG-11 KernLock::leave() 移除无用原子读）已完成；Session 6（BUG-13 FutexBucket/FutexTable 哈希桶改造）已完成 |
+| Sync | `sync.rs` | Session 5（BUG-11 KernLock::leave() 移除无用原子读）已完成；Session 6（BUG-13 FutexBucket/FutexTable 哈希桶改造、BUG-14 SyncQueue 三处冗余与语义修复）已完成 |
 
 ---
 
@@ -190,6 +190,29 @@
   `ftx_wait/ftx_wake/ftx_requeue` 接口不变；仅内部实现从单队列换成哈希桶。
 - **验证**：`cargo test --workspace --test basic` → 33/33 通过。
 - 详细分析见 `sync.rs` 底部 `Sync Debug Notes` 的 `[BUG-13]` 注释块。
+
+#### BUG-14: SyncQueue 三处冗余 / 语义问题（已修复）
+
+1. **`signal()` 的冗余分支**：`match q.len()` 的 `1 =>` 与 `_ =>` 完全相同
+   （都是 `pop_front().unwrap()` + `unpark`）。修复：合并为 `if q.is_empty() { ... } else { ... }`。
+2. **`signal_n()` 的冗余 None 分支**：`to_wake = n.min(q.len())` 已界定循环次数，
+   但循环体内仍用 `match pop_front() { Some/None }`，None 分支不可能走到。
+   修复：改为 `q.pop_front().unwrap()`。
+3. **`wait_timeout()` 返回值永远是 true**：调用方无法区分"被 signal 唤醒"与"超时到期"，
+   且超时后线程不会把自己从队列里摘掉，导致队列泄漏（虚假唤醒/超时唤醒的残留条目）。
+   该函数在 `kernel-refactored` 和 `chaos-tests-refactored` 中**均无调用方**。
+   修复：`park_timeout` 后检查线程是否仍在队列里，在队列里则自己 `remove` 并返回 `false`（超时）；
+   不在则返回 `true`（被 signal/broadcast 唤醒）。
+4. **`park_on()` 的 `if n > 256 { let _trim = n >> 3; }` 是无效预留**：`_trim` 变量立刻被丢弃，
+   虚假唤醒 / 超时唤醒未出队会导致队列无限增长。
+   修复：`q.len() > 256` 时 `pop_front` 出最老的 `n>>3` 个等待者并 `unpark` 它们
+   （stale waiter cleanup）。被剔除的线程在用户态重检 pred：pred 为 true 则消费数据，
+   为 false 则再次 park_on 重新入队。这样既限制了队列长度，又不破坏 park_on 的返回语义。
+   注意必须 `unpark` 被剔除线程，否则它们会永远挂在 `park()` 上。
+   （早期曾尝试"不入队 + pending_signals+=1 + 直接返回 true"的方案 A，但该方案让调用方
+   拿到 true 时 pred 实际并未满足，属于虚假成功，已被否决。）
+- **验证**：33/33 测试全过。
+- 详见 `sync.rs` 中 `impl SyncQueue` 后的 `[BUG-14]` 注释块。
 
 ---
 

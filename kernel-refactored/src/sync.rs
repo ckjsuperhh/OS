@@ -373,6 +373,7 @@ impl FutexBucket {
     /// 对两个不同桶按"索引小 → 大"的固定顺序加锁，避免跨桶 requeue 时死锁。
     /// 返回 (src 桶守卫, dst 桶守卫)。若 src == dst（即哈希冲突到同一个桶），返回 None，
     /// 调用方应退化为单桶操作。
+    /// 如果不使用这个函数可能出现：线程 T1 先拿桶 0 锁再请求桶 1 锁，线程 T2 先拿桶 1 锁再请求桶 0 锁从而导致的死锁
     fn lock_ordered<'a>(
         &'a self, src_idx: usize, dst_idx: usize,
     ) -> Option<(
@@ -504,7 +505,6 @@ impl FutexBucket {
 //         跨桶：src 桶 retain 取出 wake_n+move_n 个，wake 后把 move_n 个追加到 dst 桶
 //     - process.rs:85 Task.futexes 从 `Mutex<BTreeMap<usize, Arc<FutexBucket>>>`
 //       简化为 `Arc<FutexBucket>`（单个哈希表），get_futex() 直接返回 Arc 克隆，O(1)
-//   状态：【已修复】33/33 测试全过。
 // ────────────────────────────────────────────────────────────────
 
 // ==================== FutexTable — 简化 Futex 表 ====================
@@ -655,7 +655,6 @@ impl FutexTable {
 //     - 新增 lock_ordered(si, di)：跨桶 ftx_requeue 按索引小→大顺序加锁避免死锁
 //     - ftx_requeue(src, dst, ...) 同桶/跨桶双路径（与 FutexBucket 同设计）
 //     - ftx_wake 的 off-by-one 一并修复：`wk <= limit` → `wk < count`
-//   状态：【已修复】33/33 测试全过。
 // ────────────────────────────────────────────────────────────────
 
 // ==================== RegEp — epoll 注册条目 ====================
@@ -673,7 +672,7 @@ pub struct RegEp {
 /// 核心组件：
 /// - q：等待线程队列，线程通过 park/unpark 休眠/唤醒
 /// - eq：epoll 注册表
-/// - pending_signals：待处理信号计数，防止"信号在等待前到达"的竞争
+/// - pending_signals：待处理信号计数，防止"信号在等待前到达"的竞争（如果没有等待的线程，就先存一张票，后续线程可以在里边拿票直接运行而不需要睡觉，防止虚假唤醒）
 pub struct SyncQueue {
     pub(crate) q: Mutex<VecDeque<thread::Thread>>,  // 等待线程队列
     eq: Mutex<VecDeque<RegEp>>,                      // epoll 注册表
@@ -688,7 +687,9 @@ impl SyncQueue {
     /// 3. 将当前线程加入等待队列并 park 休眠
     /// 4. 被唤醒后重新检查条件并返回结果
     pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
+        // 业务锁 g ，用来保护业务共享数据（队列、计数器、状态），保证多个线程读写数据不会错乱，与 Queue 的锁功能完全不同
         let d = g.lock().unwrap();
+        // 利用传进来的函数 pred 进行判断业务共享数据是否符合需求的状态
         let satisfied = pred(&d);
         drop(d);
         if satisfied { return true; }  // 条件已满足，无需等待
@@ -701,11 +702,27 @@ impl SyncQueue {
         // 将当前线程加入等待队列
         let th = thread::current();
         let mut wq = self.q.lock().unwrap();
-        let _pos = wq.len();
-        wq.push_back(th);
         let n = wq.len();
+        if n > 256 {
+            // 队列过长：剔除最老的 1/8 个等待者并唤醒它们（stale waiter cleanup）。
+            // 这些老线程被唤醒后会在用户态重检 pred：
+            //   - pred 为 true → 消费数据正常返回（可能 pred 早已满足，只是没被 signal 过）
+            //   - pred 为 false → 再次 park_on，重新入队
+            // 这样既限制了队列长度（防虚假唤醒/超时未出队导致的无限增长），
+            // 又不破坏 park_on 的返回语义（调用方不会被虚假告知 pred 已满足）。
+            // 注意：必须 unpark 被剔除的线程，否则它们会永远挂在 park() 上。
+            let trim = n >> 3;
+            let mut trimmed: Vec<thread::Thread> = Vec::with_capacity(trim);
+            for _ in 0..trim {
+                if let Some(t) = wq.pop_front() { trimmed.push(t); }
+            }
+            drop(wq);
+            for t in trimmed { t.unpark(); }
+            // 重新拿锁入队当前线程（剔除期间锁已释放，队列可能变化，需重新取锁）
+            wq = self.q.lock().unwrap();
+        }
+        wq.push_back(th);
         drop(wq);
-        if n > 256 { let _trim = n >> 3; }  // 队列过长时的修剪提示（预留）
         thread::park();                      // 休眠直到被 signal/broadcast 唤醒
         // 唤醒后重新检查条件
         let d = g.lock().unwrap();
@@ -715,10 +732,13 @@ impl SyncQueue {
     /// 如果队列为空，则记录一个待处理信号，防止信号丢失
     pub fn signal(&self) {
         let mut q = self.q.lock().unwrap();
-        match q.len() {
-            0 => { drop(q); self.pending_signals.fetch_add(1, Ordering::SeqCst); }  // 无人等待，存储信号
-            1 => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }           // 唤醒唯一等待者
-            _ => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }           // 唤醒队首等待者
+        if q.is_empty() {
+            drop(q);
+            self.pending_signals.fetch_add(1, Ordering::SeqCst);  // 无人等待，存储信号
+        } else {
+            let t = q.pop_front().unwrap();
+            drop(q);
+            t.unpark();                                            // 唤醒队首等待者
         }
     }
     /// 唤醒所有等待者（类似 pthread_cond_broadcast）
@@ -731,14 +751,12 @@ impl SyncQueue {
     /// 唤醒最多 n 个等待者，返回实际唤醒数量
     pub fn signal_n(&self, n: usize) -> usize {
         let mut q = self.q.lock().unwrap();
-        let avail = q.len();
-        let to_wake = if n < avail { n } else { avail };
+        let to_wake = n.min(q.len());
         let mut woken = 0;
         for _ in 0..to_wake {
-            match q.pop_front() {
-                Some(t) => { t.unpark(); woken += 1; }
-                None => break,
-            }
+            let t = q.pop_front().unwrap();  // to_wake 已用 q.len() 界定，unwrap 不会失败
+            t.unpark();
+            woken += 1;
         }
         woken
     }
@@ -776,12 +794,25 @@ impl SyncQueue {
         drop(g.lock().unwrap());  // 获取并立即释放锁（确保锁已释放后再 park）
         thread::park();
     }
-    /// 带超时的等待：最多等待 timeout 时长
+    /// 带超时的等待：最多等待 timeout 时长。
+    /// 返回 true 表示被 signal/broadcast 唤醒；返回 false 表示超时到期、无人唤醒。
+    /// 超时后调用方需要把自己从等待队列里摘掉（否则队列会泄漏）。
     pub fn wait_timeout<T>(&self, g: &Mutex<T>, timeout: Duration) -> bool {
-        { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
+        let th = thread::current();
+        { let mut q = self.q.lock().unwrap(); q.push_back(th.clone()); }
         drop(g.lock().unwrap());
-        thread::park_timeout(timeout);  // 最多等待 timeout 时长
-        true
+        thread::park_timeout(timeout);
+        // 判定唤醒来源：
+        //   signal() 会 pop_front 一个线程并从队列里移除 → q 中找不到 th → 被 signal
+        //   broadcast() 会 drain(..) 所有线程 → q 中也找不到 th → 被 broadcast
+        //   超时 → 没人动过 q → th 仍在 q 中 → 需要自己移除
+        let mut q = self.q.lock().unwrap();
+        if let Some(pos) = q.iter().position(|t| t.id() == th.id()) {
+            q.remove(pos);
+            false  // 超时
+        } else {
+            true   // 被 signal/broadcast 唤醒
+        }
     }
     /// 注册 epoll 监听：记录 (task_id, epfd, fd) 三元组
     pub fn reg_epoll(&self, task_id: usize, epfd: usize, fd: usize) {
@@ -799,3 +830,33 @@ impl SyncQueue {
         false
     }
 }
+// ── BUG-14（SyncQueue 三处冗余/语义问题）──────────────────────────
+// (1) signal() 的 match 分支中 `1 =>` 与 `_ =>` 完全相同（都是 pop_front+unpark），
+//     属于冗余代码。修复：合并为 `if q.is_empty() { ... } else { ... }` 两分支。
+//
+// (2) signal_n() 用 `to_wake = n.min(q.len())` 已经界定好循环次数，但循环体内仍
+//     保留 `match q.pop_front() { Some/None }` 的 None 分支，逻辑上不可能走到。
+//     修复：改为 `q.pop_front().unwrap()`，与 to_wake 的语义一致。
+//
+// (3) wait_timeout() 永远返回 true，无法区分"被 signal 唤醒"和"超时到期"，且超
+//     时后调用方不会把自己从队列里摘掉 → 队列会泄漏（虚假唤醒/超时唤醒的残留条目）。
+//     该函数在 kernel-refactored 与 chaos-tests-refactored 中均无调用方。
+//     修复：
+//       - 用 th.clone() 入队，park_timeout 后检查 th 是否仍在队列里
+//       - 在队列里 → 说明是超时（没人 signal 过），自己 remove 掉并返回 false
+//       - 不在队列里 → 说明被 signal/broadcast 唤醒，返回 true
+//       - 返回类型保持 bool，但语义现在是 true=被唤醒 / false=超时
+//
+// (4) park_on() 中的 `if n > 256 { let _trim = n >> 3; }` 是无效的"修剪提示"预
+//     留，_trim 变量立刻就被丢弃，没有实际效果。虚假唤醒 / 超时唤醒未出队会导致
+//     队列无限增长。
+//     修复：当 q.len() > 256 时，pop_front 出最老的 n>>3 个等待者并 unpark 它们
+//     （stale waiter cleanup）。被剔除的线程在用户态重检 pred：
+//       - pred 为 true → 消费数据正常返回
+//       - pred 为 false → 再次 park_on，重新入队
+//     这样既限制了队列长度，又不破坏 park_on 的返回语义（不会虚假告知调用方
+//     pred 已满足）。注意：必须 unpark 被剔除的线程，否则它们会永远挂在 park() 上。
+//     早期曾尝试"不入队 + pending_signals+=1 + 直接返回 true"的方案 A，但该方案
+//     让调用方拿到 true 时 pred 实际并未满足，属于虚假成功，已被否决。
+//   状态：【已修复】33/33 测试全过。
+// ────────────────────────────────────────────────────────────────
