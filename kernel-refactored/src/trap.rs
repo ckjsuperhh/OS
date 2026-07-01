@@ -4,7 +4,6 @@
 //! - `Context`: CPU 寄存器文件的快照，用于保存/恢复进程执行状态，
 //!   支撑进程切换、信号投递、fork 等机制
 //! - `TrapCtl`: 中断控制器，管理中断屏蔽掩码、嵌套计数、异常分发和缺页处理
-//! - `validate_access`: 用户态地址访问验证函数（读/写/执行权限检查）
 //!
 //! 当 CPU 触发中断或异常时，TrapCtl 负责保存当前上下文、
 //! 分发到对应处理器、并在处理完成后恢复上下文。
@@ -13,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::consts::*;
-use crate::util::{CLK, check_access};
+use crate::util::CLK;
 
 // ==================== 上下文（寄存器文件快照） ====================
 
@@ -397,39 +396,3 @@ impl TrapCtl {
 //
 //   状态：【已修复】33/33 测试全过。
 // ────────────────────────────────────────────────────────────────
-
-// ==================== 地址访问验证 ====================
-
-/// 验证用户态地址范围的访问合法性。
-/// mode: 0 = 读检查, 1 = 写检查（含页统计）, 2 = 执行检查（含大小限制）。
-/// 返回 Ok(()) 表示合法，Err 表示非法（eoverflow/efault/einval）。
-pub fn validate_access(mode: u8, addr: usize, len: usize, pid: usize) -> Result<(), &'static str> {
-    if len == 0 { return Ok(()); }  // 零长度访问总是合法
-    // 溢出检查：addr + len 不能回绕
-    let end = addr.wrapping_add(len);
-    if end < addr { return Err("eoverflow"); }
-    // 内核空间检查：用户态不能访问 KERN_BASE 以上
-    if end >= KERN_BASE { return Err("efault"); }
-    match mode {
-        0 => {
-            // 模式 0：纯读检查
-            if !check_access(addr, len) { return Err("efault"); }
-            Ok(())
-        }
-        1 => {
-            // 模式 1：写检查
-            if !check_access(addr, len) { return Err("efault"); }
-            Ok(())
-        }
-        2 => {
-            // 模式 2：执行检查，额外限制访问跨度不超过堆大小
-            let aligned_addr = addr & !(PAGE_SZ - 1);
-            let aligned_end = (end + PAGE_SZ - 1) & !(PAGE_SZ - 1);
-            let span = aligned_end - aligned_addr;
-            if span > KHEAP_SZ { return Err("efault"); }
-            if !check_access(addr, len) { return Err("efault"); }
-            Ok(())
-        }
-        _ => Err("einval"),  // 无效模式
-    }
-}

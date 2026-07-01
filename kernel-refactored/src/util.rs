@@ -2,7 +2,7 @@
 //!
 //! 本模块提供不归属于特定子系统但被多处引用的基础能力：
 //! - 全局时钟系统 (CLK/CLK_ALL) 及其辅助函数 (wclk/cclk/dtk/up_ms)
-//! - 用户态地址范围验证 (check_access/check_access_rw)
+//! - 用户态地址范围验证 (check_access/check_access_rw/validate_access)
 //! - 用户空间数据安全拷贝 (cfu/ctu)
 //! - TCP/IP 网络校验和计算 (tcp_checksum/parse_ipv4_header/compute_inet_checksum)
 //! - ELF 可执行文件头部验证 (validate_elf_header)
@@ -122,6 +122,31 @@ pub fn ctu<T: Copy>(addr: usize, len: usize, _v: &T) -> bool {
 //
 //   状态：【已修复】33/33 测试全过。
 // ────────────────────────────────────────────────────────────────
+
+/// 验证用户态地址范围的访问合法性。
+/// mode: 0 = 读检查, 1 = 写检查, 2 = 执行检查（含跨度限制）。
+/// 返回 Ok(()) 表示合法，Err 表示非法（eoverflow/efault/einval）。
+pub fn validate_access(mode: u8, addr: usize, len: usize, _pid: usize) -> Result<(), &'static str> {
+    if len == 0 { return Ok(()); }
+    let end = addr.wrapping_add(len);
+    if end < addr { return Err("eoverflow"); }
+    if end >= KERN_BASE { return Err("efault"); }
+    match mode {
+        0 | 1 => {
+            if !check_access(addr, len) { return Err("efault"); }
+            Ok(())
+        }
+        2 => {
+            let aligned_addr = addr & !(PAGE_SZ - 1);
+            let aligned_end = (end + PAGE_SZ - 1) & !(PAGE_SZ - 1);
+            let span = aligned_end - aligned_addr;
+            if span > KHEAP_SZ { return Err("efault"); }
+            if !check_access(addr, len) { return Err("efault"); }
+            Ok(())
+        }
+        _ => Err("einval"),
+    }
+}
 
 // ==================== 读取设备修复 ====================
 
