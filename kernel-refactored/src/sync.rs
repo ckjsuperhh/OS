@@ -6,7 +6,7 @@
 //! - **FlgGuard**：RAII 标志守卫（中断安全临界区占位符）
 //! - **EvFlag / EvBus**：事件位编码与事件总线（带回调的通知机制）
 //! - **Sema / SemaGuard**：计数信号量与 RAII 守卫（资源计数管理）
-//! - **FutexBucket / FutexTable**：Linux 风格 futex 等待/唤醒机制
+//! - **FutexBucket / FutexTable**：哈希桶式 Linux 风格 futex 等待/唤醒机制
 //! - **SyncQueue**：线程安全等待队列（条件变量语义 + epoll 注册）
 //!
 //! 被 channel.rs（阻塞 I/O）、ipc.rs（信号量复用）、fs.rs（等待队列）等模块广泛依赖。
@@ -19,6 +19,14 @@ use std::ops::Deref;
 use std::collections::VecDeque;
 
 use crate::consts::*;
+
+/// FutexBucket 的哈希桶数量。必须为 2 的幂，便于 `hash & (N-1)` 取模。
+/// 256 桶足以把大多数地址分散到不同桶，显著降低锁争用。
+const NUM_FBUCKETS: usize = 256;
+
+/// FutexTable 的哈希桶数量。必须为 2 的幂。
+/// 比 FutexBucket 少一半——FutexTable 用于轻量场景，128 桶已足够分散。
+const NUM_FTBUCKETS: usize = 128;
 
 // ==================== KernLock — 可重入内核锁 ====================
 
@@ -91,6 +99,11 @@ impl KernLock {
         }
     }
 }
+// ── BUG-11 ─────────────────────────────────────────────────────
+// KernLock::leave() 中读取了 self.holder 到变量 h，但 h 从未被使用。
+// 这是一次无意义的原子读操作，增加了不必要的内存访问开销。
+// 修复：删除 `let h = self.holder.load(Ordering::Relaxed);` 这一行。
+// ────────────────────────────────────────────────────────────────
 // KernLock 可以在线程间安全地共享和传递（通过原子操作保证线程安全）
 unsafe impl Send for KernLock {}
 unsafe impl Sync for KernLock {}
@@ -274,6 +287,8 @@ impl Sema {
     /// 自旋获取：循环调用 try_acquire 直到成功获取或信号量被移除
     pub fn acquire_spin(&self) -> Result<(), &'static str> {
         loop {
+            // 若 try_acquire() 返回 Ok(true) / Ok(false)：? 把 bool 提取出来，交给外层 match 匹配；
+            // 若 try_acquire() 返回 Err(msg)：直接让 acquire_spin 函数提前返回 Err(msg)，跳出自旋循环，整个获取锁操作失败。
             match self.try_acquire()? {
                 true => return Ok(()),
                 false => thread::yield_now(),  // 获取失败，让出 CPU 后重试
@@ -281,6 +296,7 @@ impl Sema {
         }
     }
     /// 获取信号量并返回 RAII 守卫；守卫 drop 时自动 release
+    // 本质就是：封装自旋获取 + RAII 自动释放的安全接口
     pub fn access(&self) -> Result<SemaGuard<'_>, &'static str> {
         self.acquire_spin()?;
         Ok(SemaGuard { s: self })
@@ -309,17 +325,72 @@ impl<'a> Deref for SemaGuard<'a> {
     fn deref(&self) -> &Self::Target { self.s }
 }
 
-// ==================== FutexBucket — 地址级 Futex 等待队列 ====================
+// ==================== FutexBucket — 哈希桶式 Futex 等待队列 ====================
 
-/// 每个地址对应一个等待队列桶，实现 Linux 风格的 futex wait/wake。
-/// 等待者以三元组 (地址, 线程句柄, 唤醒标志) 存储。
-/// 唤醒标志 Arc<AtomicBool> 用于区分"被正常唤醒"和"超时唤醒"。
+// Fast Userspace Mutex，快速用户态互斥锁
+// 无竞争时完全在用户态执行，不陷入内核；只有发生锁竞争、线程需要阻塞休眠时，才进入内核挂起线程。
+// 一般需要构建多个哈希桶，对不同地址进行哈希进入同一个桶来统一管理，比如四个桶，那么A:1000，B:1002，C：1004，那么用朴素取模的时候就会有A和C放进一个桶中。
+// 我认为这个桶实现有点太差了，在处理多地址的情况，他仿佛是把所有
+
+/// 哈希桶式 futex 等待队列，实现 Linux 风格的 futex wait/wake。
+/// 内部维护 NUM_FBUCKETS=256 个独立桶，每个桶有自己的 Mutex，按地址哈希索引。
+/// - 查桶 O(1)，不同地址的 wait/wake 走不同 Mutex，互不阻塞
+/// - 等待者以 (地址, 线程句柄, 唤醒标志) 三元组存储；唤醒标志用于区分正常唤醒/超时唤醒
+/// - 跨桶 requeue 使用"按地址大小顺序加锁"避免死锁
 pub struct FutexBucket {
-    waiters: Mutex<VecDeque<(usize, thread::Thread, Arc<AtomicBool>)>>,
+    // 256 个独立桶，每个桶一把 Mutex。按 hash(addr) & (NUM_FBUCKETS - 1) 索引。
+    // 互斥锁<双端队列<三元组(地址, 线程句柄, 唤醒标志)>>
+    buckets: Box<[Mutex<VecDeque<(usize, thread::Thread, Arc<AtomicBool>)>>; NUM_FBUCKETS]>,
 }
+
 impl FutexBucket {
-    /// 创建一个新的空 futex 桶
-    pub fn new() -> Self { Self { waiters: Mutex::new(VecDeque::new()) } }
+    /// 创建一个新的空 futex 哈希桶（256 个桶全部初始化为空）
+    pub fn new() -> Self {
+        Self { buckets: Box::new(std::array::from_fn(|_| Mutex::new(VecDeque::new()))) }
+    }
+
+    /// 地址 → 桶索引的哈希函数。
+    /// 位混洗风格（fxhash 思路）：先右移 2 位去除 4 字节对齐的低位 0，
+    /// 再与右移 13 位的结果异或，把高位信息混入低位，最后掩码到 [0, NUM_FBUCKETS)。
+    #[inline]
+    fn hash(addr: usize) -> usize {
+        let h = (addr >> 2) ^ (addr >> 13);
+        h & (NUM_FBUCKETS - 1)
+    }
+
+    /// 取地址对应桶的 Mutex 引用
+    #[inline]
+    fn bucket(&self, addr: usize) -> &Mutex<VecDeque<(usize, thread::Thread, Arc<AtomicBool>)>> {
+        &self.buckets[Self::hash(addr)]
+    }
+
+    /// 向指定地址所属的桶压入一个等待者（线程 + 唤醒标志）。
+    /// 供外部在已经构造好 flag 的场景下直接入队（比如 wait 内部使用，或 Task 层做批量迁移）。
+    pub fn enqueue(&self, addr: usize, t: thread::Thread, flag: Arc<AtomicBool>) {
+        self.bucket(addr).lock().unwrap().push_back((addr, t, flag));
+    }
+
+    /// 对两个不同桶按"索引小 → 大"的固定顺序加锁，避免跨桶 requeue 时死锁。
+    /// 返回 (src 桶守卫, dst 桶守卫)。若 src == dst（即哈希冲突到同一个桶），返回 None，
+    /// 调用方应退化为单桶操作。
+    fn lock_ordered<'a>(
+        &'a self, src_idx: usize, dst_idx: usize,
+    ) -> Option<(
+        std::sync::MutexGuard<'a, VecDeque<(usize, thread::Thread, Arc<AtomicBool>)>>,
+        std::sync::MutexGuard<'a, VecDeque<(usize, thread::Thread, Arc<AtomicBool>)>>,
+    )> {
+        if src_idx == dst_idx { return None; }
+        if src_idx < dst_idx {
+            let a = self.buckets[src_idx].lock().unwrap();
+            let b = self.buckets[dst_idx].lock().unwrap();
+            Some((a, b))
+        } else {
+            let b = self.buckets[dst_idx].lock().unwrap();
+            let a = self.buckets[src_idx].lock().unwrap();
+            Some((a, b))
+        }
+    }
+
     /// 在指定地址上等待：
     /// 1. 先原子比较 val 是否等于 expected（防止丢失唤醒）
     /// 2. 不等则立即返回 Err("changed")
@@ -327,18 +398,25 @@ impl FutexBucket {
     /// 4. 被唤醒后检查标志：true=正常唤醒返回 Ok，false=超时返回 Err
     pub fn wait(&self, addr: usize, expected: u32, val: &AtomicU32, timeout: Option<Duration>) -> Result<(), &'static str> {
         let flag = Arc::new(AtomicBool::new(false));
-        // 关键：先比较再入队，防止竞争条件
+        // 先比较再入队，如果此线程原本没有拿到锁而准备 wait ，那么此时发现锁已经被解放了就可以不需要入队而是直接去竞争锁。
+        // 否则很有可能上一个线程已经 wake 过了，锁解放了，但是依然入队，结果就是锁一直被释放但是线程没有人唤醒。
+        // SeqCst 最严格，必须保证前后都不能有重排，也就是他必须在他该在的地方。
         if val.load(Ordering::SeqCst) != expected { return Err("changed"); }
-        { let mut w = self.waiters.lock().unwrap();
+        // 获取桶的锁并且队列加入新元素，离开作用域自动释放锁
+        { let mut w = self.bucket(addr).lock().unwrap();
           w.push_back((addr, thread::current(), flag.clone())); }
-        // park 当前线程，带或不带超时
+        // park 当前线程，d 判断带或不带超时
+        // 两种方式都可以通过别的线程拿着这个线程的句柄调用 thread::unpark() 使代码继续运行，这个函数调用的时候会把 flag 设置为 true ，而超时的也可以通过超时恢复运行，但是不对 flag 进行操作。
         if let Some(d) = timeout { thread::park_timeout(d); } else { thread::park(); }
+        // thread::park() / thread::park_timeout() 是阻塞调用，线程执行到这一步会立刻挂起、让出 CPU，代码停在这里不再往下走
+        // 只有线程被唤醒（两种方式），代码才会继续往后执行，走到最后的 flag 判断。
         if flag.load(Ordering::Relaxed) { Ok(()) } else { Err("timeout") }
     }
+
     /// 唤醒在指定地址上等待的最多 count 个线程
     /// 返回实际唤醒的线程数量
     pub fn wake(&self, addr: usize, count: usize) -> usize {
-        let mut w = self.waiters.lock().unwrap();
+        let mut w = self.bucket(addr).lock().unwrap();
         let mut woken = 0;
         // retain 遍历：匹配地址且未达上限的唤醒并移除，其余保留
         w.retain(|(a, t, f)| {
@@ -351,53 +429,146 @@ impl FutexBucket {
         });
         woken
     }
+
     /// 重新排队（Linux FUTEX_REQUEUE）：
     /// 从 src 地址唤醒 wake_n 个线程，并将 move_n 个线程移动到 dst 地址。
     /// 避免"惊群效应"——不需要唤醒所有等待者再让它们重新等待另一个地址。
+    /// 跨桶时按 (src_idx, dst_idx) 大小顺序加锁以避免死锁；
+    /// 同桶时退化为单桶扫描。
     pub fn requeue(&self, src: usize, dst: usize, wake_n: usize, move_n: usize) -> usize {
-        let mut w = self.waiters.lock().unwrap();
-        let (mut wk, mut mv) = (0, 0);
-        for e in w.iter_mut() {
-            if e.0 == src {
-                if wk < wake_n {
-                    e.2.store(true, Ordering::Relaxed);  // 标记唤醒
-                    e.1.unpark();
-                    wk += 1;
-                } else if mv < move_n {
-                    e.0 = dst;  // 将等待地址从 src 改为 dst
-                    mv += 1;
+        let si = Self::hash(src);
+        let di = Self::hash(dst);
+        // ── 同桶路径：src 与 dst 哈希到同一个桶 ──
+        if si == di {
+            let mut w = self.buckets[si].lock().unwrap();
+            let (mut wk, mut mv) = (0, 0);
+            for e in w.iter_mut() {
+                if e.0 == src {
+                    if wk < wake_n {
+                        e.2.store(true, Ordering::Relaxed);
+                        e.1.unpark();
+                        wk += 1;
+                    } else if mv < move_n {
+                        e.0 = dst;  // 将等待地址从 src 改为 dst（桶内改写即可）
+                        mv += 1;
+                    }
                 }
             }
+            // 清理已被唤醒的条目
+            w.retain(|(_, _, f)| !f.load(Ordering::Relaxed));
+            return wk;
         }
-        // 清理已被唤醒的条目
-        w.retain(|(_, _, f)| !f.load(Ordering::Relaxed));
+        // ── 跨桶路径：按索引顺序加锁避免死锁 ──
+        let (mut sg, mut dg) = self.lock_ordered(si, di).unwrap();
+        let (mut wk, mut mv) = (0, 0);
+        let mut moved: VecDeque<(usize, thread::Thread, Arc<AtomicBool>)> = VecDeque::new();
+        // 扫描 src 桶：前 wake_n 个唤醒，接下来 move_n 个取出暂存
+        sg.retain(|e| {
+            if e.0 != src { return true; }
+            if wk < wake_n {
+                e.2.store(true, Ordering::Relaxed);
+                e.1.unpark();
+                wk += 1;
+                false  // 从 src 桶移除（已唤醒）
+            } else if mv < move_n {
+                mv += 1;
+                moved.push_back((dst, e.1.clone(), e.2.clone()));
+                false  // 从 src 桶移除（待入 dst 桶）
+            } else { true }
+        });
+        // 把暂存的等待者批量追加到 dst 桶
+        dg.extend(moved);
         wk
     }
+
     /// 查询指定地址上的等待者数量
     pub fn pending_at(&self, addr: usize) -> usize {
-        self.waiters.lock().unwrap().iter().filter(|(a, _, _)| *a == addr).count()
+        self.bucket(addr).lock().unwrap().iter().filter(|(a, _, _)| *a == addr).count()
     }
 }
+// ── BUG-13（FutexBucket 部分）──────────────────────────────────────
+// 设计缺陷：原为单一大队列，所有地址 waiters 混在一个 VecDeque 里。
+//   原问题：
+//     - wake/requeue/pending_at 全部线性扫描 O(n)
+//     - 一把 Mutex 被所有地址共享 → 不同地址的 wait/wake 互相阻塞
+//     - requeue 的"任意将 src 条目改为 dst"语义，反向证明桶并不按地址分区
+//
+//   修复（Linux 风格 futex_hash_bucket）：
+//     - 内部维护 NUM_FBUCKETS=256 个独立桶，每桶一把 Mutex
+//     - 哈希函数：`hash(addr) = ((addr >> 2) ^ (addr >> 13)) & (NUM_FBUCKETS-1)`
+//     - 查桶 O(1)，不同地址走不同 Mutex，锁争用下降 N 倍
+//     - 新增 enqueue(addr, ...) 辅助方法：供外部直接入队（已构造 flag 的场景）
+//     - 新增 lock_ordered(si, di)：跨桶 requeue 按索引小→大顺序加锁避免死锁
+//     - requeue(src, dst, ...) 支持同桶/跨桶两种路径：
+//         同桶：退化为单桶扫描，src 条目就地改写为 dst
+//         跨桶：src 桶 retain 取出 wake_n+move_n 个，wake 后把 move_n 个追加到 dst 桶
+//     - process.rs:85 Task.futexes 从 `Mutex<BTreeMap<usize, Arc<FutexBucket>>>`
+//       简化为 `Arc<FutexBucket>`（单个哈希表），get_futex() 直接返回 Arc 克隆，O(1)
+//   状态：【已修复】33/33 测试全过。
+// ────────────────────────────────────────────────────────────────
 
 // ==================== FutexTable — 简化 Futex 表 ====================
 
-/// 基于表的简化 futex 实现。
+/// 基于哈希桶的简化 futex 实现。
 /// 与 FutexBucket 不同，只记录 (地址, 线程) 二元组，
 /// 没有唤醒标志——无法区分正常唤醒和虚假唤醒。
 /// 适合不需要超时等待的简单场景。
+/// 内部维护 NUM_FTBUCKETS=128 个独立桶，按地址哈希索引，锁争用比单 Mutex 下降 N 倍。
 pub struct FutexTable {
-    table: Mutex<VecDeque<(usize, thread::Thread)>>,
+    // 128 个独立桶，每个桶一把 Mutex。按 hash(addr) & (NUM_FTBUCKETS - 1) 索引。
+    table: Box<[Mutex<VecDeque<(usize, thread::Thread)>>; NUM_FTBUCKETS]>,
 }
 
 impl FutexTable {
-    /// 创建一个新的空 futex 表
-    pub fn new() -> Self { Self { table: Mutex::new(VecDeque::new()) } }
+    /// 创建一个新的空 futex 哈希表（128 个桶全部初始化为空）
+    pub fn new() -> Self {
+        Self { table: Box::new(std::array::from_fn(|_| Mutex::new(VecDeque::new()))) }
+    }
+
+    /// 地址 → 桶索引的哈希函数（与 FutexBucket 同思路，仅常量不同）
+    #[inline]
+    fn hash(addr: usize) -> usize {
+        let h = (addr >> 2) ^ (addr >> 13);
+        h & (NUM_FTBUCKETS - 1)
+    }
+
+    /// 取地址对应桶的 Mutex 引用
+    #[inline]
+    fn bucket(&self, addr: usize) -> &Mutex<VecDeque<(usize, thread::Thread)>> {
+        &self.table[Self::hash(addr)]
+    }
+
+    /// 向指定地址所属的桶压入一个等待者（地址 + 线程）。
+    /// 供外部做批量迁移或直接入队使用。
+    pub fn enqueue(&self, addr: usize, t: thread::Thread) {
+        self.bucket(addr).lock().unwrap().push_back((addr, t));
+    }
+
+    /// 对两个不同桶按"索引小 → 大"的固定顺序加锁，避免跨桶 requeue 时死锁。
+    /// 返回 (src 桶守卫, dst 桶守卫)；若 src == dst 返回 None。
+    fn lock_ordered<'a>(
+        &'a self, src_idx: usize, dst_idx: usize,
+    ) -> Option<(
+        std::sync::MutexGuard<'a, VecDeque<(usize, thread::Thread)>>,
+        std::sync::MutexGuard<'a, VecDeque<(usize, thread::Thread)>>,
+    )> {
+        if src_idx == dst_idx { return None; }
+        if src_idx < dst_idx {
+            let a = self.table[src_idx].lock().unwrap();
+            let b = self.table[dst_idx].lock().unwrap();
+            Some((a, b))
+        } else {
+            let b = self.table[dst_idx].lock().unwrap();
+            let a = self.table[src_idx].lock().unwrap();
+            Some((a, b))
+        }
+    }
 
     /// 等待：比较 val == expected 后入队并 park
     /// 返回 false 表示值已变化（无需等待），true 表示已完成等待
     pub fn ftx_wait(&self, addr: usize, expected: u32, val: &AtomicU32) -> bool {
         if val.load(Ordering::SeqCst) != expected { return false; }
-        let mut wq = self.table.lock().unwrap();
+        let mut wq = self.bucket(addr).lock().unwrap();
         wq.push_back((addr, thread::current()));
         drop(wq);           // 先释放锁再 park，防止死锁
         thread::park();
@@ -407,55 +578,85 @@ impl FutexTable {
     /// 唤醒指定地址的最多 count 个等待者
     /// 返回实际唤醒的数量
     pub fn ftx_wake(&self, addr: usize, count: usize) -> usize {
-        let mut wq = self.table.lock().unwrap();
-        let target = addr;
-        let limit = count;
+        let mut wq = self.bucket(addr).lock().unwrap();
         let mut wk = 0usize;
-        let mut cursor = 0;
-        let total = wq.len();
-        // 遍历队列，匹配目标地址的唤醒并移除
-        while cursor < wq.len() && wk <= limit {
-            if wq[cursor].0 == target {
+        // retain 遍历：匹配目标地址且未达上限的唤醒并移除，其余保留
+        wq.retain(|(a, t)| {
+            if *a == addr && wk < count {
+                t.unpark();
                 wk += 1;
-                if wk < limit {
-                    let entry = wq.remove(cursor).unwrap();
-                    entry.1.unpark();
-                } else {
-                    cursor += 1;
-                }
-            } else {
-                cursor += 1;
-            }
-        }
+                false  // 从桶中移除
+            } else { true }
+        });
         wk
     }
 
-    /// 重新排队：从 src_addr 唤醒 wake_n 个，将 move_n 个移动到 dst_addr
+    /// 重新排队：从 src_addr 唤醒 wake_n 个，将 move_n 个移动到 dst_addr。
+    /// 跨桶时按 (src_idx, dst_idx) 大小顺序加锁以避免死锁；
+    /// 同桶时退化为单桶扫描。
     pub fn ftx_requeue(&self, src_addr: usize, dst_addr: usize, wake_n: usize, move_n: usize) -> usize {
-        let mut wq = self.table.lock().unwrap();
-        let mut wk = 0;
-        let mut mv = 0;
-        let mut i = 0;
-        while i < wq.len() {
-            if wq[i].0 == src_addr {
-                if wk < wake_n {
-                    let (_, t) = wq.remove(i).unwrap();
-                    t.unpark();
-                    wk += 1;
-                } else if mv < move_n {
-                    wq[i].0 = dst_addr;  // 将等待地址改为 dst_addr
-                    mv += 1;
-                    i += 1;
+        let si = Self::hash(src_addr);
+        let di = Self::hash(dst_addr);
+        // ── 同桶路径 ──
+        if si == di {
+            let mut wq = self.table[si].lock().unwrap();
+            let (mut wk, mut mv) = (0, 0);
+            let mut i = 0;
+            while i < wq.len() {
+                if wq[i].0 == src_addr {
+                    if wk < wake_n {
+                        let (_, t) = wq.remove(i).unwrap();
+                        t.unpark();
+                        wk += 1;
+                    } else if mv < move_n {
+                        wq[i].0 = dst_addr;  // 将等待地址改为 dst_addr（桶内改写即可）
+                        mv += 1;
+                        i += 1;
+                    } else {
+                        i += 1;
+                    }
                 } else {
                     i += 1;
                 }
-            } else {
-                i += 1;
             }
+            return wk;
         }
+        // ── 跨桶路径：按索引顺序加锁避免死锁 ──
+        let (mut sg, mut dg) = self.lock_ordered(si, di).unwrap();
+        let (mut wk, mut mv) = (0, 0);
+        let mut moved: VecDeque<(usize, thread::Thread)> = VecDeque::new();
+        sg.retain(|(a, t)| {
+            if *a != src_addr { return true; }
+            if wk < wake_n {
+                t.unpark();
+                wk += 1;
+                false  // 已唤醒，从 src 桶移除
+            } else if mv < move_n {
+                mv += 1;
+                moved.push_back((dst_addr, t.clone()));
+                false  // 待迁移到 dst 桶
+            } else { true }
+        });
+        dg.extend(moved);
         wk
     }
 }
+// ── BUG-13（FutexTable 部分）───────────────────────────────────────
+// 设计缺陷：与 FutexBucket 同样的"单一大队列"问题——所有地址 waiters 混在一起。
+//   原问题：
+//     - ftx_wake / ftx_requeue 全表扫描 O(n)
+//     - 单 Mutex 被所有地址共享，锁争用严重
+//     - ftx_wake 中存在 off-by-one：`wk <= limit` 导致实际可能唤醒 count+1 个线程
+//
+//   修复：
+//     - 内部维护 NUM_FTBUCKETS=128 个独立桶（比 FutexBucket 轻，适合简单场景）
+//     - 哈希函数与 FutexBucket 同思路，仅常量不同
+//     - 新增 enqueue(addr, t) 辅助方法：供外部直接入队
+//     - 新增 lock_ordered(si, di)：跨桶 ftx_requeue 按索引小→大顺序加锁避免死锁
+//     - ftx_requeue(src, dst, ...) 同桶/跨桶双路径（与 FutexBucket 同设计）
+//     - ftx_wake 的 off-by-one 一并修复：`wk <= limit` → `wk < count`
+//   状态：【已修复】33/33 测试全过。
+// ────────────────────────────────────────────────────────────────
 
 // ==================== RegEp — epoll 注册条目 ====================
 
@@ -598,8 +799,3 @@ impl SyncQueue {
         false
     }
 }
-// ── Sync Debug Notes ─────────────────────────────────────────────
-// [BUG-11] KernLock::leave() 中读取了 self.holder 到变量 h，但 h 从未被使用。
-//   这是一次无意义的原子读操作，增加了不必要的内存访问开销。
-//   修复：删除 `let h = self.holder.load(Ordering::Relaxed);` 这一行。
-// ─────────────────────────────────────────────────────────────────

@@ -461,15 +461,19 @@ let sema = Sema::new(1);  // 二值信号量（互斥锁语义）
 
 ---
 
-## 八、FutexBucket — 地址级 Futex 等待队列
+## 八、FutexBucket — 哈希桶式 Futex 等待队列
 
 ### 8.1 结构体定义
 
 ```rust
-/// 每个地址对应一个等待队列桶，实现 Linux 风格的 futex
+/// FutexBucket 的哈希桶数量（必须为 2 的幂）
+const NUM_FBUCKETS: usize = 256;
+
+/// 哈希桶式 futex 等待队列，实现 Linux 风格的 futex wait/wake。
+/// 内部维护 256 个独立桶，每个桶有自己的 Mutex，按地址哈希索引。
 pub struct FutexBucket {
-    /// 等待者列表：(等待地址, 线程句柄, 唤醒标志)
-    waiters: Mutex<VecDeque<(usize, thread::Thread, Arc<AtomicBool>)>>,
+    /// 256 个独立桶，每个桶存一组 (等待地址, 线程句柄, 唤醒标志) 三元组
+    buckets: Box<[Mutex<VecDeque<(usize, thread::Thread, Arc<AtomicBool>)>>; NUM_FBUCKETS]>,
 }
 ```
 
@@ -478,67 +482,78 @@ pub struct FutexBucket {
 - `thread::Thread`：线程句柄，用于 `unpark()` 唤醒
 - `Arc<AtomicBool>`：唤醒标志，区分"被正常唤醒"和"超时"
 
+**关键设计：**
+- 哈希函数：`hash(addr) = ((addr >> 2) ^ (addr >> 13)) & (NUM_FBUCKETS - 1)`，位混洗风格
+- 256 个桶各有独立 `Mutex` → 不同地址的 wait/wake 走不同锁，互不阻塞
+- 查桶 O(1)，线性扫描局限在本桶内（不再是全队列扫描）
+
 ### 8.2 核心操作
 
 ```rust
 /// 在指定地址上等待：
 /// 1. 先检查 val 的当前值是否等于 expected（原子比较）
 /// 2. 如果不等，立即返回 Err("changed")——防止丢失唤醒
-/// 3. 相等则将当前线程加入等待队列并 park
+/// 3. 相等则将当前线程加入该地址对应的桶并 park
 /// 4. 支持可选超时
 pub fn wait(&self, addr: usize, expected: u32, val: &AtomicU32,
             timeout: Option<Duration>) -> Result<(), &'static str> {
     let flag = Arc::new(AtomicBool::new(false));
-    // 关键：先比较再入队，防止竞争
     if val.load(Ordering::SeqCst) != expected { return Err("changed"); }
-    { let mut w = self.waiters.lock().unwrap();
+    { let mut w = self.bucket(addr).lock().unwrap();
       w.push_back((addr, thread::current(), flag.clone())); }
-    // park 当前线程（带或不带超时）
     if let Some(d) = timeout { thread::park_timeout(d); } else { thread::park(); }
-    // 被唤醒后检查标志：true = 正常唤醒，false = 超时
     if flag.load(Ordering::Relaxed) { Ok(()) } else { Err("timeout") }
 }
 
-/// 唤醒在指定地址上等待的最多 count 个线程
+/// 唤醒在指定地址上等待的最多 count 个线程（只扫本桶）
 pub fn wake(&self, addr: usize, count: usize) -> usize {
-    let mut w = self.waiters.lock().unwrap();
+    let mut w = self.bucket(addr).lock().unwrap();
     let mut woken = 0;
-    // retain 遍历：匹配地址且未达上限的唤醒并移除
     w.retain(|(a, t, f)| {
         if *a == addr && woken < count {
-            f.store(true, Ordering::Relaxed);  // 设置唤醒标志
-            t.unpark();                         // 唤醒线程
+            f.store(true, Ordering::Relaxed);
+            t.unpark();
             woken += 1;
-            false                               // 从队列中移除
-        } else { true }                         // 保留
+            false
+        } else { true }
     });
     woken
 }
 
-/// 重新排队：从 src 地址唤醒 wake_n 个，并将 move_n 个移动到 dst 地址
-/// 这是 Linux FUTEX_REQUEUE 操作的实现，避免"惊群效应"
+/// 重新队列：从 src 地址唤醒 wake_n 个，并将 move_n 个移动到 dst 地址。
+/// 跨桶时按"索引小 → 大"的固定顺序加锁避免死锁。
+/// 同桶时退化为单桶扫描，src 条目就地改写为 dst。
 pub fn requeue(&self, src: usize, dst: usize, wake_n: usize, move_n: usize) -> usize { ... }
 
-/// 查询指定地址上的等待者数量
+/// 向指定地址所属的桶压入一个等待者（供外部直接入队）
+pub fn enqueue(&self, addr: usize, t: thread::Thread, flag: Arc<AtomicBool>) { ... }
+
+/// 查询指定地址上的等待者数量（只扫本桶）
 pub fn pending_at(&self, addr: usize) -> usize { ... }
 ```
 
 ---
 
-## 九、FutexTable — 简化 Futex 表
+## 九、FutexTable — 简化 Futex 哈希表
 
 ### 9.1 结构体定义
 
 ```rust
-/// 基于表的简化 futex 实现，等待者只记录 (地址, 线程) 二元组
+/// FutexTable 的哈希桶数量（必须为 2 的幂）
+const NUM_FTBUCKETS: usize = 128;
+
+/// 基于哈希桶的简化 futex 实现，等待者只记录 (地址, 线程) 二元组
 pub struct FutexTable {
-    table: Mutex<VecDeque<(usize, thread::Thread)>>,
+    /// 128 个独立桶，每个桶存一组 (等待地址, 线程句柄) 二元组
+    table: Box<[Mutex<VecDeque<(usize, thread::Thread)>>; NUM_FTBUCKETS]>,
 }
 ```
 
 **与 FutexBucket 的区别：**
 - 没有 `Arc<AtomicBool>` 唤醒标志——无法区分正常唤醒和虚假唤醒
+- 只有 128 桶（轻量场景）
 - `ftx_wait` 不返回 `Result`，而是简单的 `bool`
+- 同样支持跨桶 `ftx_requeue`（有序加锁避免死锁）和 `enqueue` 辅助方法
 - 实现更简洁，适合不需要超时等待的场景
 
 ### 9.2 方法

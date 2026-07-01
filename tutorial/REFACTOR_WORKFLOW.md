@@ -20,7 +20,7 @@
 |---|---|---|
 | Channel | `channel.rs` | CircBuf 和 Channel 已完成重构；Session 2（BUG-06 API 委托）已完成；Session 3（BUG-07 关闭检查）已完成 |
 | Signal | `signal.rs` | Session 4（BUG-08/09/10 信号集合操作优化）已完成 |
-| Sync | `sync.rs` | Session 5（BUG-11 KernLock::leave() 移除无用原子读）已完成 |
+| Sync | `sync.rs` | Session 5（BUG-11 KernLock::leave() 移除无用原子读）已完成；Session 6（BUG-13 FutexBucket/FutexTable 哈希桶改造）已完成 |
 
 ---
 
@@ -158,6 +158,38 @@
 #### 验证结果
 
 - 所有 33 个 basic 测试通过
+
+---
+
+## Session 6 — FutexBucket / FutexTable 哈希桶改造
+
+**Date**: 2026-07-01
+**Module**: sync.rs / process.rs
+
+#### BUG-13: FutexBucket / FutexTable 单一大队列 → 哈希多桶（已修复）
+
+- **问题**：`FutexBucket` 名为"地址级等待队列"，实际是单一大 `VecDeque`，
+  所有地址的 waiters 混在一起。`wake/requeue/pending_at` 全部线性扫描（O(n)），
+  且一把 `Mutex` 被所有地址共享，不同地址的 wait/wake 互相阻塞。
+  `process.rs` 的 `BTreeMap<usize, Arc<FutexBucket>>` 外层已按地址分桶，
+  导致桶内 `addr` 字段实际冗余（逻辑错位）。
+- **修复（Linux 风格 futex_hash_bucket）**：
+  1. `FutexBucket` 内部维护 `NUM_FBUCKETS=256` 个独立桶，每桶一把 `Mutex`
+  2. `FutexTable` 内部维护 `NUM_FTBUCKETS=128` 个独立桶（轻量场景）
+  3. 哈希函数：`hash(addr) = ((addr >> 2) ^ (addr >> 13)) & (N-1)`，位混洗风格
+  4. 查桶 O(1)，不同地址走不同 `Mutex`，锁争用下降 N 倍
+  5. 新增 `enqueue(addr, ...)` 辅助方法：供外部直接入队（已构造 flag 的场景）
+  6. 新增 `lock_ordered(si, di)`：跨桶 requeue 按索引小→大顺序加锁避免死锁
+  7. `requeue(src, dst, ...)` 支持两种路径：
+     - 同桶（src 与 dst 哈希到同一桶）：退化为单桶扫描，src 条目就地改写为 dst
+     - 跨桶：src 桶 `retain` 取出 `wake_n + move_n` 个，wake 后把 move_n 个追加到 dst 桶
+  8. `process.rs` 的 `Task.futexes` 从 `Mutex<BTreeMap<usize, Arc<FutexBucket>>>`
+     简化为 `Arc<FutexBucket>`（单个哈希表），`get_futex()` 直接返回 `Arc` 克隆，O(1)
+  9. 顺手修复了原 `FutexTable::ftx_wake` 的 off-by-one：`wk <= limit` 改为 `wk < count`
+- **原 API 签名保持向后兼容**：`wait/wake/requeue/pending_at` 和
+  `ftx_wait/ftx_wake/ftx_requeue` 接口不变；仅内部实现从单队列换成哈希桶。
+- **验证**：`cargo test --workspace --test basic` → 33/33 通过。
+- 详细分析见 `sync.rs` 底部 `Sync Debug Notes` 的 `[BUG-13]` 注释块。
 
 ---
 

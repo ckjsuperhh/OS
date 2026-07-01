@@ -82,7 +82,7 @@ pub struct Task {
     pub files: Mutex<BTreeMap<usize, FLike>>,     // 文件描述符表（fd -> FLike）
     pub cwd: Mutex<String>,                       // 当前工作目录
     pub exec_path: Mutex<String>,                 // 可执行文件路径
-    pub futexes: Mutex<BTreeMap<usize, Arc<FutexBucket>>>, // futex 表（用户地址 -> 等待桶）
+    pub futexes: Arc<FutexBucket>,                // futex 哈希表（内部 256 桶按地址哈希分区）
     pub sem_ctx: Mutex<SemCtx>,                   // System V 信号量上下文
     pub shm_ctx: Mutex<ShmCtx>,                   // System V 共享内存上下文
     pub pid: Mutex<Pid>,                          // 进程 PID
@@ -109,7 +109,7 @@ impl Task {
             files: Mutex::new(BTreeMap::new()),
             cwd: Mutex::new("/".to_string()),
             exec_path: Mutex::new(String::new()),
-            futexes: Mutex::new(BTreeMap::new()),
+            futexes: Arc::new(FutexBucket::new()),
             sem_ctx: Mutex::new(SemCtx::default()),
             shm_ctx: Mutex::new(ShmCtx::default()),
             pid: Mutex::new(Pid::new()),
@@ -170,13 +170,10 @@ impl Task {
         self.files.lock().unwrap().get(&fd).cloned()
     }
 
-    /// 获取或创建指定用户地址的 futex 等待桶
-    pub fn get_futex(&self, uaddr: usize) -> Arc<FutexBucket> {
-        let mut fx = self.futexes.lock().unwrap();
-        if !fx.contains_key(&uaddr) {
-            fx.insert(uaddr, Arc::new(FutexBucket::new()));
-        }
-        fx.get(&uaddr).unwrap().clone()
+    /// 获取本任务的 futex 哈希表。
+    /// 调用方再对该表调用 wait/wake/requeue 并传入地址即可——桶内按地址哈希分区。
+    pub fn get_futex(&self) -> Arc<FutexBucket> {
+        self.futexes.clone()
     }
 
     /// 进程退出处理：关闭所有文件、触发事件通知、设置退出状态
