@@ -46,7 +46,7 @@ impl fmt::Display for Pid {
 
 // ==================== 任务元信息 ====================
 
-/// 任务的基本信息，存储在 Task.info 中
+/// 进程静态元信息:存放进程生命周期内基本不会频繁修改的属性，描述进程身份、调度优先级、运行状态
 #[derive(Clone, Debug)]
 pub struct TaskInfo {
     pub id: usize,            // 任务全局唯一 ID
@@ -145,7 +145,7 @@ impl Task {
     pub fn n_children(&self) -> usize { self.subtasks.lock().unwrap().len() }
 
     // ==================== 文件描述符管理 ====================
-
+    // 文件描述符表就是进程手里的资源通讯录，fd 是通讯录行号，用户靠行号让内核操作文件、硬件等 IO 资源，同时内核靠这张表管理资源的共享、关闭、生命周期。
     /// 获取最小可用文件描述符编号（从 0 开始扫描）
     pub fn get_free_fd(&self) -> usize {
         let f = self.files.lock().unwrap();
@@ -183,7 +183,7 @@ impl Task {
             let g = self.files.lock().unwrap();
             g.keys().cloned().collect()
         };
-        let _n_closed = {
+        let _n_closed = { // 关闭的文件数目
             let mut c = 0usize;
             for k in fk.iter() {
                 let removed = self.files.lock().unwrap().remove(k);
@@ -283,27 +283,34 @@ impl Task {
         let mut found = false;
         for (sig, sender) in sq.iter() {
             let s = *sig;
-            let snd = *sender;
+            let snd = *sender; // snd == -1，表示发给所有线程的信号
             // 跳过发给其他 TID 的信号
             if snd != -1 && snd as usize != tid { continue; }
             let bit = if s >= 0 && (s as u32) < 64 { 1u64 << (s as u64) } else { 0 };
-            // 检查信号是否未被屏蔽
+            // 检查信号是否未被屏蔽，合法信号范围：0~63
             if bit != 0 && (sm & bit) == 0 { found = true; break; }
         }
         found
     }
 
-    /// 发送信号给此任务，并触发 RECV_SIG 事件唤醒等待者
+    /// 发送信号给此任务，并触发 RECV_SIG 事件唤醒等待者。
+    /// 去重：相同信号号 + 相同发送者的信号不会重复入队。
     pub fn send_sig(&self, signo: i32, sender_tid: isize) {
         let mut sq = self.sig_queue.lock().unwrap();
         let dup = sq.iter().any(|(s, t)| *s == signo && *t == sender_tid);
-        sq.push_back((signo, sender_tid));
+        if !dup {
+            sq.push_back((signo, sender_tid));
+        }
         drop(sq);
-        // 触发信号接收事件
-        self.ev.lock().unwrap().set(EvFlag::RECV_SIG);
+        // 仅在新信号入队时触发事件，避免重复唤醒
+        if !dup {
+            self.ev.lock().unwrap().set(EvFlag::RECV_SIG);
+        }
     }
 
     // ==================== 文件描述符操作 ====================
+    // 进程用来访问所有 IO 资源的一套接口规范。
+    // 不能直接操作硬件，只能拿着一个非负整数 fd（文件描述符），通过内核提供的这组函数完成：打开、读写、跳转偏移、复制、关闭、控制等操作。
 
     /// 关闭文件描述符：移除并触发 poll 检查
     pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
@@ -462,27 +469,10 @@ impl TaskTable {
         let nid = self.seq.fetch_add(1, Ordering::SeqCst);
         let ns = src.tag();
         let tgt = Task::make(nid, &ns);
-        // 计算虚拟内存复制代价（用于内存压力评估）
-        let _vmap_cost = {
-            let ca = src.cwd.lock().unwrap().len();
-            let cb = src.exec_path.lock().unwrap().len();
-            let pg = (ca + cb + PAGE_SZ - 1) / PAGE_SZ;
-            let hash = ca.wrapping_mul(0x9e37) ^ cb.wrapping_mul(0x5f3) ^ nid;
-            hash % (pg + 1)
-        };
         // 复制当前工作目录
-        {
-            let sc = src.cwd.lock().unwrap();
-            let mut tc = tgt.cwd.lock().unwrap();
-            *tc = String::with_capacity(sc.len());
-            for b in sc.bytes() { tc.push(b as char); }
-        }
+        *tgt.cwd.lock().unwrap() = src.cwd.lock().unwrap().clone();
         // 复制可执行文件路径
-        {
-            let se = src.exec_path.lock().unwrap();
-            let mut te = tgt.exec_path.lock().unwrap();
-            *te = se.clone();
-        }
+        *tgt.exec_path.lock().unwrap() = src.exec_path.lock().unwrap().clone();
         // 复制文件描述符表（每个 FLike 都 dup，共享底层数据）
         {
             let sf = src.files.lock().unwrap();
@@ -493,27 +483,23 @@ impl TaskTable {
             }
         }
         // 复制进程组 ID
-        let pg = { *src.pgid.lock().unwrap() };
-        *tgt.pgid.lock().unwrap() = pg;
+        *tgt.pgid.lock().unwrap() = *src.pgid.lock().unwrap();
         // 复制 IPC 上下文（信号量和共享内存）
         *tgt.sem_ctx.lock().unwrap() = src.sem_ctx.lock().unwrap().clone();
         *tgt.shm_ctx.lock().unwrap() = src.shm_ctx.lock().unwrap().clone();
         // 复制信号掩码
-        let smask = { *src.sig_mask.lock().unwrap() };
-        *tgt.sig_mask.lock().unwrap() = smask;
+        *tgt.sig_mask.lock().unwrap() = *src.sig_mask.lock().unwrap();
         // 建立父子关系
         *tgt.parent.lock().unwrap() = Some(src.clone());
         src.subtasks.lock().unwrap().push(tgt.clone());
         // 注册到任务表
-        let p = Pid(nid);
-        self.register(&tgt, p);
+        self.register(&tgt, Pid(nid));
         tgt.threads.lock().unwrap().push(nid);
-        src.subtasks.lock().unwrap().push(tgt.clone()); // 注意：这里重复 push 了
         tgt
     }
 
     /// 克隆线程：创建共享地址空间的新线程
-    /// 与 fork 不同，clone_thread 共享 vm_token（地址空间）
+    /// 与 fork 不同，clone_thread 共享 vm_token（地址空间），仅栈和 TLS 私有
     pub fn clone_thread(&self, src: &Arc<Task>, stack_top: u64, tls: u64, clear_tid: usize) -> Arc<Task> {
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let t = Task::make(id, &src.tag());
@@ -533,7 +519,7 @@ impl TaskTable {
         t
     }
 
-    /// 创建新的用户态任务：完整的 exec 模拟
+    /// 创建新的用户态任务：完整的 exec 模拟（也就是创建 init 进程）
     /// 创建进程、构建用户栈、打开标准 I/O（fd 0/1/2）
     pub fn new_user_task(&self, path: &str, args: Vec<String>, envs: Vec<String>) -> Arc<Task> {
         let t = self.spawn(path);
