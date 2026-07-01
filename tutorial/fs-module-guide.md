@@ -782,3 +782,503 @@ fs.rs
 4. **MountTable 的 resolve 递归**：极端情况下可能导致栈溢出，可改为迭代实现
 5. **Disk.read_block 的无限循环**：如果没有 journal 且 errs 不为 0 也不为 MAX，`read_block` 可能死循环
 6. **FLike 的 read/write 与 FHandle 的 read/write 代码重复**：FLike 内联了完整的读写逻辑，没有复用 FHandle 的方法
+
+---
+
+## 十八、宏观视角：fs.rs 的整体架构
+
+把整个文件系统子系统想象成一台机器，自下而上分 **7 层核心模块**，外加 **5 个横向子系统**。
+
+### 18.1 七层核心模块（自下而上）
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ Layer 6: 文件描述符      FdOpt / FdState / FHandle              │ ← 进程 fd 表项
+├────────────────────────────────────────────────────────────────┤
+│ Layer 5: 统一文件抽象    FLike (VFS 分发层)                      │ ← 多态分发
+├────────────────────────────────────────────────────────────────┤
+│ Layer 4: 管道            PipeBuf / PipeNode (单向字节流)         │ ← 进程间流式 IPC
+├────────────────────────────────────────────────────────────────┤
+│ Layer 3: 挂载表          MountTable / MountEntry                 │ ← 多文件系统统一视图
+├────────────────────────────────────────────────────────────────┤
+│ Layer 2: 页缓存          PageCache / PageCacheEntry (LRU)        │ ← 文件内容缓存
+├────────────────────────────────────────────────────────────────┤
+│ Layer 1: 块缓存          BlockCache / CacheChain (组相联)        │ ← 磁盘块缓存
+├────────────────────────────────────────────────────────────────┤
+│ Layer 0: 磁盘            Disk + Journal + 故障注入               │ ← 物理存储
+└────────────────────────────────────────────────────────────────┘
+```
+
+**每层的核心职责（一句话版）：**
+
+| 层 | 结构体 | 解决什么问题 |
+|---|---|---|
+| **L0 磁盘** | `Disk` | 物理块读写，含 journal（WAL 日志）和故障注入用于测试 |
+| **L1 块缓存** | `BlockCache` / `CacheChain` / `CacheSlot` | 组相联结构（set-associative），缓存热磁盘块，避免重复 I/O |
+| **L2 页缓存** | `PageCache` / `PageCacheEntry` | LRU 策略缓存文件内容，把"文件偏移 → 页帧"映射起来 |
+| **L3 挂载表** | `MountTable` / `MountEntry` | 把多个文件系统挂到一棵目录树上，`resolve()` 把路径翻译成 (mount, inode) |
+| **L4 管道** | `PipeBuf` / `PipeNode` | UNIX 管道：固定容量环形缓冲 + 读写端引用计数 + 自动关闭 |
+| **L5 统一文件抽象** | `FLike` | VFS 分发层——`File` / `Pipe` / `Socket` / `Inode` 多态统一到一个枚举 |
+| **L6 文件描述符** | `FdOpt` / `FdState` / `FHandle` | 进程 fd 表里的每一项：选项（O_NONBLOCK、FD_CLOEXEC）+ 状态（位置、锁）+ 文件句柄 |
+
+### 18.2 五个横向子系统
+
+| 子系统 | 结构 | 跨层作用 |
+|---|---|---|
+| **Epoll** | `EpInst` / `EpEvent` / `EpData` / `EpCtlOp` | 事件多路复用，监听多个 fd 的 I/O 事件（类似 Linux `epoll`） |
+| **Terminal I/O** | `TrmIO` / `WinSz` | termios 设置 + 窗口大小，给 TTY 设备用 |
+| **伪文件系统** | `PseudoNode` | `/proc`、`/dev` 等虚拟节点（不存盘，动态生成内容） |
+| **内核对象注册表** | `KObjRegistry` / `KObjEntry` | 统一登记设备、IPC、内核服务等对象（按 ID 反查） |
+| **I/O 调度队列** | `IoQueue` / `IoRequest` | SCAN 电梯算法，合并/重排磁盘请求减少寻道 |
+
+### 18.3 对外暴露的接口清单（按层分类）
+
+#### L0 磁盘
+- `Disk::new(blocks, errs)` / `read_block(bno)` / `write_block(bno, data)` / `with_journal(j)` / `inject_fault()`
+
+#### L1 块缓存
+- `BlockCache::new(sets, ways)` / `get(bno)` / `put(bno, data)` / `invalidate(bno)` / `flush()`
+
+#### L2 页缓存
+- `PageCache::new(cap)` / `get(inode, off)` / `put(inode, off, page)` / `evict()` / `drop_inode(inode)`
+
+#### L3 挂载表
+- `MountTable::new()` / `mount(path, fs)` / `umount(path)` / `resolve(path)` → `(MountEntry, inode)`
+
+#### L4 管道
+- `PipeNode::new(cap)` / `read(buf)` / `write(buf)` / `close(dir: PipeDir)` / `Drop` 自动回收
+
+#### L5 统一文件抽象
+- `FLike::File(h)` / `Pipe(n)` / `Socket(...)` / `Inode(...)` 四种变体
+- 统一接口：`read(buf)` / `write(buf)` / `seek(pos)` / `close()` / `poll()` / `stat()`
+
+#### L6 文件描述符
+- `FdOpt::new()` / `set_nonblock()` / `set_cloexec()`
+- `FdState::new()` / `pos()` / `set_pos()`
+- `FHandle::new(flike)` / `read(buf)` / `write(buf)` / `seek(FSeek)` / `dup()` / `close()`
+
+#### 子系统接口
+- `EpInst::new()` / `ctl(op, fd, event)` / `wait(events, timeout)` —— epoll
+- `TrmIO::default()` / `set_attr()` / `get_winsz()` —— TTY
+- `PseudoNode::new(name, gen_fn)` / `read()` —— 伪文件系统
+- `KObjRegistry::new()` / `register(obj)` / `lookup(id)` —— 内核对象
+- `IoQueue::new()` / `submit(req)` / `dispatch(disk)` —— I/O 调度
+
+### 18.4 核心数据流（进程读文件）
+
+```
+用户态 read(fd, buf, n)
+    │
+    ▼ sys_read
+Task.files.get(fd) → FHandle
+    │
+    ▼ FHandle.read(buf)
+FLike::read(buf)  ── 多态分发 ──┐
+    │                           │
+    ▼ 如果是 File               ▼ 如果是 Pipe
+查 MountTable → 找到 inode       PipeNode.read(buf)
+    │                              ↓ 从 PipeBuf 弹字节
+    ▼                              
+查 PageCache（按 inode, offset）
+    │
+    ├─ 命中 → 直接拷贝页内容
+    └─ 未命中
+        │
+        ▼ 查 BlockCache（按 bno）
+        │
+        ├─ 命中 → 拼成页 → 写入 PageCache
+        └─ 未命中
+            │
+            ▼ IoQueue.submit(req)
+            │
+            ▼ IoQueue.dispatch(disk)  ← SCAN 电梯算法
+            │
+            ▼ Disk.read_block(bno)  ← 含 journal 重放 / 故障注入
+            │
+            ▼ 反向填充 BlockCache → PageCache → 用户 buf
+```
+
+### 18.5 设计上的几个亮点
+
+1. **FLike 是 VFS 思想的简化版**：一个 enum 把 File/Pipe/Socket/Inode 统一起来，调用方无需关心底层类型
+2. **两级缓存结构**：BlockCache（块级，组相联）+ PageCache（文件级，LRU），各司其职；前者减少磁盘 I/O，后者减少块缓存查找
+3. **PipeNode 用引用计数自动关闭**：读写端各有一个 `Arc` 引用，全关了自动触发 `Drop` 释放 `PipeBuf`
+4. **MountTable 的 `resolve()` 是路径翻译的中枢**：`/a/b/c` 一路解析，跨挂载点自动切换 fs 实例
+5. **IoQueue 用 SCAN 电梯算法**：磁头来回扫，合并相邻请求，显著降低寻道时间
+6. **Disk 内嵌 journal（WAL）**：写操作先落日志再落盘，崩溃后能重放恢复一致性；还能 `inject_fault()` 做鲁棒性测试
+7. **伪文件系统独立成块**：`/proc`、`/dev` 这类虚拟文件不占盘，靠 `PseudoNode` 动态生成内容
+
+### 18.6 建议阅读顺序
+
+1. **先 L0 → L1 → L2**（存储栈：`Disk` → `BlockCache` → `PageCache`，建立"数据从哪来"的认知）
+2. **然后看 L3**（`MountTable` 把多个文件系统挂到一棵目录树上）
+3. **再看 L5 → L6**（`FLike` 统一分发，`FHandle` 管进程 fd）
+4. **接着看 L4**（`PipeNode` 是独立分支，理解进程间流式通信）
+5. **最后看子系统**（`EpInst` / `IoQueue` / `KObjRegistry` 等按需阅读）
+
+这样能先建立"数据从磁盘到进程的完整路径"认知，再看"多文件系统怎么统一"和"特殊机制（epoll、调度、伪文件）"。
+
+---
+
+## 十九、进阶任务：configFS 概念与实现思路
+
+configFS 是 Linux 内核中一个精巧的伪文件系统设计，它和 procfs、sysfs 并列但职责截然不同。本节的目的是让你理解 configFS 的设计哲学，并思考如何在 Chaos 内核的现有 fs.rs 框架上实现一个简化版的 configFS。
+
+### 19.1 configFS 是什么？
+
+configFS 是一个**完全驻留在内存中的伪文件系统**，挂载在 `/sys/kernel/config`。它的核心思想用一句话概括：
+
+> **sysfs 让内核把对象"展示"给用户态看；configFS 让用户态把对象"创建"给内核用。**
+
+| 特性 | procfs (`/proc`) | sysfs (`/sys`) | configFS (`/sys/kernel/config`) |
+|------|------------------|----------------|-------------------------------|
+| 对象由谁创建 | 内核自动生成 | 内核自动生成 | **用户态 mkdir 创建** |
+| 对象由谁销毁 | 内核自动回收 | 内核自动回收 | **用户态 rmdir 销毁** |
+| 主要用途 | 查看进程/系统状态 | 查看设备/驱动拓扑 | **配置内核子系统** |
+| 生命周期驱动方 | 内核 | 内核 | **用户态** |
+| 典型例子 | `/proc/self/status` | `/sys/class/net/eth0` | `/sys/kernel/config/target/...` |
+
+简言之：procfs/sysfs 是**只读展示窗口**，configFS 是**可写控制面板**。
+
+### 19.2 Linux configFS 的核心抽象
+
+Linux configFS 定义了 5 个核心结构体，层层嵌套：
+
+```
+configfs_subsystem          ← 子系统（最顶层注册单元）
+  └─ config_group (su_group) ← 根组（子系统的主目录）
+       └─ config_group       ← 子组（用户态 mkdir 创建的子目录）
+            └─ config_item   ← 项目（用户态 mkdir 创建的叶子目录）
+                 └─ configfs_attribute  ← 属性（目录下的文件，可读写）
+```
+
+各结构的职责：
+
+| 结构体 | 角色 | 类比 |
+|--------|------|------|
+| `config_item` | 一个可配置的内核对象 | 文件系统中的一个**目录** |
+| `config_group` | 一组 config_item 的容器 | 一个**可创建子目录的目录** |
+| `config_item_type` | 描述某类 item 有哪些属性和操作 | 目录的**类型定义**（类似 vtable） |
+| `configfs_attribute` | item 下的一个可读写属性 | 目录下的一个**文件** |
+| `configfs_subsystem` | 子系统的注册入口 | 整个 configFS 下的一个**顶级目录** |
+
+### 19.3 用户态如何操作 configFS？
+
+用户态通过**标准文件系统 syscall** 与 configFS 交互，不需要任何特殊 API：
+
+```bash
+# 挂载 configFS
+mount -t configfs none /sys/kernel/config
+
+# 假设某内核子系统 "my_subsys" 已注册
+cd /sys/kernel/config/my_subsys
+
+# 创建一个 config_item（内核收到 mkdir 回调，分配对象）
+mkdir my_item_0
+
+# 读写属性（内核收到 show/store 回调）
+echo "hello" > my_item_0/greeting
+cat my_item_0/greeting
+
+# 创建子组（如果 type 支持 make_group 回调）
+mkdir my_item_0/sub_group
+
+# 删除（内核收到 drop_item 回调，释放对象）
+rmdir my_item_0
+
+# 创建符号链接（连接两个 item，内核收到 allow_link 回调）
+ln -s my_item_0 other_group/link_to_item
+```
+
+对应的内核回调链：
+
+| 用户态操作 | 内核回调 | 说明 |
+|-----------|---------|------|
+| `mkdir name` | `make_item(group, name)` 或 `make_group(group, name)` | 创建新 item/group |
+| `rmdir name` | `drop_item(group, item)` | 销毁 item |
+| `cat attr` | `attr.show(item, buf)` | 读属性 |
+| `echo > attr` | `attr.store(item, buf)` | 写属性 |
+| `ln -s target link` | `allow_link(src, target)` | 创建符号链接 |
+| `rm link` | `drop_link(src, target)` | 删除符号链接 |
+
+### 19.4 回调函数签名（Linux 原版）
+
+```c
+// 属性读写
+ssize_t (*show)(struct config_item *item, char *page);
+ssize_t (*store)(struct config_item *item, const char *page, size_t count);
+
+// 组操作：创建子 item / 子 group
+struct config_item *(*make_item)(struct config_group *group, const char *name);
+struct config_group *(*make_group)(struct config_group *group, const char *name);
+
+// 组操作：销毁子 item
+void (*drop_item)(struct config_group *group, struct config_item *item);
+
+// 符号链接
+int (*allow_link)(struct config_item *src, struct config_item *target);
+void (*drop_link)(struct config_item *src, struct config_item *target);
+
+// 生命周期
+void (*release)(struct config_item *item);
+```
+
+### 19.5 在 Chaos 内核中的实现思路
+
+#### 19.5.1 现状分析
+
+当前 fs.rs 已有如下可复用的基础设施：
+
+| 现有结构 | 可复用之处 |
+|---------|-----------|
+| `PseudoNode` | 只读伪文件，可作为 configFS 属性的雏形（但需扩展为可读写） |
+| `MountTable` | 挂载表，`bind("/config", "configfs")` 即可注册 |
+| `FLike` | 文件操作分发 enum，可新增 `Config` 变体 |
+| `FHandle` | 文件描述符管理，读/写/seek 语义已完备 |
+| `PageCache` / `BlockCache` | configFS 纯内存，**不需要**这两层 |
+
+需要新增的：
+1. **目录树结构**（config_item / config_group 的树）
+2. **类型系统**（config_item_type，定义每个 item 有哪些属性和回调）
+3. **属性读写**（类似 PseudoNode 但可写，且内容由回调动态生成）
+4. **FLike 新变体**（`FLike::Config(ConfigNode)`）
+
+#### 19.5.2 建议的 Rust 数据结构
+
+```rust
+use std::sync::{Arc, Mutex};
+use std::collections::BTreeMap;
+
+// ==================== configFS 核心结构 ====================
+
+/// 属性描述：名称 + 权限 + 读写回调
+pub struct ConfigAttr {
+    pub name: String,
+    pub mode: u16,  // 0o444 = 只读, 0o644 = 可读写
+    pub show: fn(&ConfigItem) -> String,       // 读回调
+    pub store: fn(&ConfigItem, &str) -> Result<(), &'static str>,  // 写回调
+}
+
+/// 类型描述：定义一类 item 有哪些属性和操作
+pub struct ConfigItemType {
+    pub name: String,
+    pub attrs: Vec<ConfigAttr>,
+    pub can_make_item: bool,   // 是否允许 mkdir 创建子 item
+    pub can_make_group: bool,  // 是否允许 mkdir 创建子 group
+    pub can_link: bool,        // 是否允许 symlink
+}
+
+/// 配置项：对应一个目录
+pub struct ConfigItem {
+    pub name: String,
+    pub item_type: Arc<ConfigItemType>,
+    pub parent: Option<Arc<ConfigGroup>>,
+    pub data: Mutex<BTreeMap<String, String>>,  // 动态数据存储
+    pub refcount: AtomicUsize,
+}
+
+/// 配置组：可以包含子 item / 子 group 的目录
+pub struct ConfigGroup {
+    pub item: ConfigItem,  // 组本身也是一个 item
+    pub children: Mutex<BTreeMap<String, ConfigChild>>,
+    pub default_groups: Vec<Arc<ConfigGroup>>,
+}
+
+/// 子节点：item 或 group
+pub enum ConfigChild {
+    Item(Arc<ConfigItem>),
+    Group(Arc<ConfigGroup>),
+}
+
+/// 子系统：最顶层注册单元
+pub struct ConfigSubsystem {
+    pub name: String,
+    pub root: Arc<ConfigGroup>,
+    pub lock: Mutex<()>,
+}
+
+/// configFS 全局管理器
+pub struct ConfigFS {
+    pub subsystems: Mutex<BTreeMap<String, Arc<ConfigSubsystem>>>,
+}
+```
+
+#### 19.5.3 与现有 FLike 的集成
+
+```rust
+// 在 FLike enum 中新增变体
+pub enum FLike {
+    File(FHandle),
+    Pipe(PipeNode),
+    Ep(EpInst),
+    Config(ConfigNode),  // ← 新增
+}
+
+/// configFS 文件节点（打开一个 config 属性文件后的句柄）
+pub struct ConfigNode {
+    pub item: Arc<ConfigItem>,
+    pub attr_name: String,
+    pub offset: usize,
+}
+
+impl ConfigNode {
+    pub fn read(&mut self, buf: &mut [u8]) -> usize {
+        let content = (self.item.item_type.attrs[...].show)(&self.item);
+        let bytes = content.as_bytes();
+        if self.offset >= bytes.len() { return 0; }
+        let n = min(bytes.len() - self.offset, buf.len());
+        buf[..n].copy_from_slice(&bytes[self.offset..self.offset + n]);
+        self.offset += n;
+        n
+    }
+
+    pub fn write(&mut self, buf: &[u8]) -> Result<usize, &'static str> {
+        let s = std::str::from_utf8(buf).map_err(|_| "utf8")?;
+        // 找到对应的 attr，调用 store 回调
+        for attr in &self.item.item_type.attrs {
+            if attr.name == self.attr_name {
+                (attr.store)(&self.item, s.trim())?;
+                return Ok(buf.len());
+            }
+        }
+        Err("noattr")
+    }
+}
+```
+
+#### 19.5.4 与 MountTable 的集成
+
+在 MountTable 中注册 configFS：
+
+```rust
+// 内核初始化时
+mt.bind("/config", "configfs");
+```
+
+当用户态 `open("/config/my_subsys/item_0/greeting")` 时，路径解析流程：
+
+```
+MountTable::resolve("/config/my_subsys/item_0/greeting")
+    → 匹配前缀 "/config"，target = "configfs"
+    → 子路径 = "my_subsys/item_0/greeting"
+    → ConfigFS::lookup("my_subsys/item_0/greeting")
+        → 找到 subsystem "my_subsys"
+        → 在 root group 中找 item "item_0"
+        → 在 item_0 的 attrs 中找 "greeting"
+        → 返回 ConfigNode { item, attr_name: "greeting" }
+    → 包装为 FLike::Config(node)
+```
+
+#### 19.5.5 mkdir / rmdir 的处理
+
+```rust
+impl ConfigFS {
+    /// 用户态 mkdir → 内核创建 item
+    pub fn mkdir(&self, path: &str, name: &str) -> Result<(), &'static str> {
+        let group = self.resolve_group(path)?;
+        let item_type = &group.item.item_type;
+
+        if item_type.can_make_group {
+            let new_group = Arc::new(ConfigGroup::new(name, ...));
+            group.children.lock().unwrap()
+                .insert(name.to_string(), ConfigChild::Group(new_group));
+        } else if item_type.can_make_item {
+            let new_item = Arc::new(ConfigItem::new(name, ...));
+            group.children.lock().unwrap()
+                .insert(name.to_string(), ConfigChild::Item(new_item));
+        } else {
+            return Err("eperm");
+        }
+        Ok(())
+    }
+
+    /// 用户态 rmdir → 内核销毁 item
+    pub fn rmdir(&self, path: &str, name: &str) -> Result<(), &'static str> {
+        let group = self.resolve_group(path)?;
+        let mut children = group.children.lock().unwrap();
+        if children.remove(name).is_some() {
+            Ok(())  // Arc 引用计数归零时自动 drop
+        } else {
+            Err("noent")
+        }
+    }
+}
+```
+
+### 19.6 实现步骤建议
+
+按如下顺序推进，每一步都能独立验证：
+
+| 步骤 | 内容 | 验证方法 |
+|------|------|---------|
+| **1** | 定义 `ConfigItem` / `ConfigGroup` / `ConfigAttr` / `ConfigItemType` 结构体 | 编译通过 + 单元测试构造一个 item |
+| **2** | 实现 `ConfigFS::register_subsystem()` 和 `ConfigFS::lookup()` | 手动注册一个子系统，查询属性 |
+| **3** | 实现 `ConfigNode`（read/write）并加入 `FLike::Config` 变体 | 通过 FLike 接口读写属性 |
+| **4** | 在 MountTable 中 `bind("/config", "configfs")`，连接路径解析 | open + read + write config 属性文件 |
+| **5** | 实现 mkdir / rmdir（`ConfigFS::mkdir` / `rmdir`） | 用户态 mkdir 创建 item，rmdir 销毁 |
+| **6** | 实现 symlink（`allow_link` / `drop_link`）| ln -s 创建跨 item 链接 |
+| **7** | 添加一个示例子系统（如 `demo_subsys`），包含可配置的属性 | 端到端测试 |
+
+### 19.7 与 PseudoNode 的关系
+
+现有的 `PseudoNode` 是一个**静态只读**的伪文件，可以作为理解 configFS 的跳板：
+
+| 特性 | PseudoNode | ConfigNode |
+|------|-----------|------------|
+| 内容来源 | 构造时写入 `Vec<u8>` | 通过 `show()` 回调动态生成 |
+| 可写 | 否（`write_at` 返回 Err） | 是（通过 `store()` 回调） |
+| 层级结构 | 无（平铺） | 树形（group → item → attr） |
+| 生命周期 | 内核决定 | 用户态 mkdir/rmdir 决定 |
+| 引用计数 | 无 | `AtomicUsize` + 回调释放 |
+
+可以理解为：**configFS 是 PseudoNode 的"进化版"**——从单个只读文件，进化为可读写、有层级、用户态控制生命周期的配置树。
+
+### 19.8 一个完整的例子：demo 子系统
+
+假设我们要实现一个 `demo` 子系统，它允许用户创建"计数器"item，每个 item 有一个 `value` 属性：
+
+```rust
+// 1. 定义类型
+fn demo_show(item: &ConfigItem) -> String {
+    item.data.lock().unwrap()
+        .get("value").cloned().unwrap_or("0".to_string())
+}
+
+fn demo_store(item: &ConfigItem, s: &str) -> Result<(), &'static str> {
+    s.parse::<i64>().map_err(|_| "einval")?;
+    item.data.lock().unwrap().insert("value".to_string(), s.to_string());
+    Ok(())
+}
+
+let demo_type = Arc::new(ConfigItemType {
+    name: "counter".to_string(),
+    attrs: vec![ConfigAttr {
+        name: "value".to_string(),
+        mode: 0o644,
+        show: demo_show,
+        store: demo_store,
+    }],
+    can_make_item: true,
+    can_make_group: false,
+    can_link: false,
+});
+
+// 2. 注册子系统
+let subsys = ConfigSubsystem::new("demo", demo_type);
+configfs.register_subsystem(subsys);
+
+// 3. 用户态操作
+// mkdir /config/demo/counter0     → 创建 item
+// echo 42 > /config/demo/counter0/value  → 写属性
+// cat /config/demo/counter0/value → 读属性，输出 "42"
+// rmdir /config/demo/counter0     → 销毁 item
+```
+
+### 19.9 设计要点总结
+
+1. **用户态驱动生命周期**：对象只在用户态 mkdir 时存在，rmdir 时消失——内核不主动创建或回收
+2. **回调即策略**：`show`/`store`/`make_item`/`drop_item` 等回调把"如何处理"的决定权交给子系统实现者
+3. **引用计数保证安全**：即使 rmdir 了，如果还有 fd 打开着属性文件，item 不会真正释放（refcount → 0 才 drop）
+4. **树形结构映射目录**：subsystem → group → item → attr 的嵌套天然对应 /config/subsys/group/item/attr 的路径
+5. **纯内存，无需持久化**：configFS 的所有数据都在 RAM 中，重启后消失——配置是临时的，由用户态脚本在启动时重建
+

@@ -551,3 +551,135 @@ process.rs
 4. **exit_proc 中的 FDT 审计代码**：退出时计算 fd 间隙数的代码（`_fdt_audit`）仅用于调试，在生产环境可移除
 5. **ProcInit::push_at 使用 wrapping_sub**：栈地址计算使用 `wrapping_sub` 可能在溢出时产生错误结果
 6. **缺少 exec 后的 cloexec 自动关闭**：虽然 `do_exec` 中有关闭 cloexec fd 的逻辑，但 `fork_task` 不处理 cloexec
+
+---
+
+## 十二、宏观视角：process.rs 的整体架构
+
+process.rs 定义了混沌内核中**进程与线程的完整数据模型**，从最底层的标识符到顶层的全局任务表，逐层构建出一个类 Unix 的进程管理框架。
+
+### 12.1 整体分层图
+
+```
+  L6  ProcInit          ← 初始进程引导（构造 init 的 argv/envp 栈布局）
+       │
+  L5  CapSet            ← Linux 风格能力集（effective/permitted/inheritable）
+       │
+  L4  TaskTable         ← 全局任务注册表（pid → Task 映射，分配/回收 pid）
+       │
+  L3  Task              ← 核心：18+ Mutex 字段，聚合进程所有资源
+       │  ├─ vm: VmMap            （虚拟地址空间）
+       │  ├─ fdt: Vec<FHandle>    （文件描述符表）
+       │  ├─ cwd / root           （工作目录）
+       │  ├─ signals: SigSet      （信号集）
+       │  ├─ subtasks: Vec<Task>  （子进程列表）
+       │  ├─ futexes: FutexBucket （futex 哈希桶）
+       │  ├─ sem_ctx / shm_ctx    （IPC 上下文）
+       │  └─ ...                  （更多 Mutex 字段）
+       │
+  L2  ThdCtx            ← 线程上下文（寄存器快照 + 内核栈指针）
+       │
+  L1  TaskInfo          ← 任务元信息（uid/gid/state/exit_code/priority/nice/...）
+       │
+  L0  Pid / Tid / Pgid / Sid  ← 四类标识符（进程/线程/进程组/会话）
+```
+
+### 12.2 各层职责一览
+
+| 层 | 类型 | 核心职责 |
+|----|------|----------|
+| **L0** | `Pid` / `Tid` / `Pgid` / `Sid` | 唯一标识进程、线程、进程组、会话；提供 `Display` 和比较 trait |
+| **L1** | `TaskInfo` | 不可变元信息：uid、gid、状态（Runnable/Zombie/Stopped）、退出码、优先级、nice 值 |
+| **L2** | `ThdCtx` | 可变执行上下文：通用寄存器快照、内核栈帧指针，用于上下文切换时保存/恢复 CPU 状态 |
+| **L3** | `Task` | 进程资源聚合器：用 18+ `Mutex<T>` 字段持有虚拟内存、文件表、信号、子进程、IPC 等全部状态 |
+| **L4** | `TaskTable` | 全局注册表：维护 `pid → Arc<Task>` 映射，提供分配/回收/遍历/查找接口 |
+| **L5** | `CapSet` | 权限控制：三个位图（effective/permitted/inheritable）实现细粒度 Linux capability 语义 |
+| **L6** | `ProcInit` | 引导初始化：构造 init 进程的用户栈（argv、envp、aux vector），设置入口地址 |
+
+### 12.3 核心接口清单（按层分组）
+
+**L0 — 标识符**
+- `Pid(usize)` / `Tid(usize)` / `Pgid(i32)` / `Sid(i32)` — 四类 ID 的 newtype 包装
+
+**L1 — TaskInfo**
+- `TaskInfo::new(pid, tid, uid, gid) -> TaskInfo` — 构造默认元信息
+- `TaskInfo::state() -> TaskState` / `set_state(s)` — 任务状态读写
+
+**L2 — ThdCtx**
+- `ThdCtx::new() -> ThdCtx` — 创建空上下文
+- `ThdCtx::save(regs)` / `restore() -> Regs` — 寄存器快照保存与恢复
+
+**L3 — Task（核心方法）**
+- `Task::new(info, ctx) -> Task` — 构造一个新任务
+- `Task::fork_task(tgt_pid, inherit_flags) -> Result<Task>` — 复制当前任务为子进程（选择性继承 fd、vm、信号等）
+- `Task::exit_proc(code)` — 标记进程退出，关闭所有 fd，通知父进程
+- `Task::get_fd(fd) -> Result<FHandle>` / `alloc_fd() -> usize` — 文件描述符查找与分配
+- `Task::set_signal(sig)` / `consume_signal() -> Option<Sig>` — 信号投递与消费
+- `Task::get_futex() -> Arc<FutexBucket>` — 获取进程级 futex 哈希桶
+
+**L4 — TaskTable**
+- `TaskTable::new() -> TaskTable` — 创建空任务表
+- `TaskTable::alloc_pid() -> Pid` — 分配下一个可用 pid
+- `TaskTable::insert(pid, task)` / `remove(pid)` — 注册/注销任务
+- `TaskTable::get(pid) -> Option<Arc<Task>>` — 按 pid 查找任务
+- `TaskTable::iter() -> impl Iterator<Item = (Pid, Arc<Task>)>` — 遍历所有任务
+
+**L5 — CapSet**
+- `CapSet::new() -> CapSet` — 初始化为全零能力集
+- `CapSet::raise(cap)` / `drop(cap)` — 设置/清除某个 capability 位
+- `CapSet::is_effective(cap) -> bool` — 检查某 capability 是否生效
+- `CapSet::check_permitted(cap) -> Result<()>` — 权限检查，失败返回 EPERM
+
+**L6 — ProcInit**
+- `ProcInit::new() -> ProcInit` — 创建引导结构
+- `ProcInit::push_at(sp, data) -> usize` — 向用户栈写入数据（argv/envp 字符串）
+- `ProcInit::build_init_stack(argv, envp) -> (usize, usize)` — 构造 init 栈布局，返回 (栈顶地址, 入口地址)
+
+### 12.4 核心数据流：fork_task 创建子进程
+
+```
+父进程调用 SYS_FORK
+    │
+    ▼
+TaskTable::alloc_pid()        → 分配新 Pid
+    │
+    ▼
+cur_task.fork_task(child_pid, INHERITABLE_MASK)
+    │
+    ├─ 复制 TaskInfo（uid/gid/priority/nice）
+    ├─ 复制 ThdCtx（寄存器快照）
+    ├─ 选择性复制 fdt（遵循 INHERITABLE_MASK，跳过 cloexec fd）
+    ├─ 复制 cwd / root 路径
+    ├─ 复制 vm_token（brk 地址，不含物理页 → COW 待实现）
+    ├─ 创建空信号集、空子进程列表
+    ├─ 克隆 futexes（Arc 共享 FutexBucket）
+    └─ 初始化 sem_ctx / shm_ctx 为空
+    │
+    ▼
+TaskTable::insert(child_pid, Arc::new(child_task))
+    │
+    ▼
+父进程 subtasks.lock().push(child.clone())
+    │
+    ▼
+返回 child_pid 给父进程（子进程返回 0）
+```
+
+### 12.5 设计亮点
+
+1. **分层标识符**：Pid/Tid/Pgid/Sid 四种 newtype 避免了裸 `usize`/`i32` 的语义混淆，类型系统即文档
+2. **Mutex 字段化设计**：Task 的每个资源域独立加锁，允许并发访问不同字段（如同时操作 fd 和信号），避免大锁竞争
+3. **TaskTable 的 Arc 语义**：所有 Task 以 `Arc<Task>` 形式注册，引用计数自然支持父子关系和异步回收
+4. **INHERITABLE_MASK 控制 fork 继承**：fork 时通过位掩码精确控制哪些 fd 被继承，符合 POSIX `O_CLOEXEC` 语义
+5. **CapSet 三集模型**：effective / permitted / inheritable 三个位图完整复现 Linux capability 的权限传播规则
+6. **ProcInit 独立引导**：将 init 进程的栈布局构造隔离为独立类型，避免污染 Task 的通用逻辑
+
+### 12.6 建议阅读顺序
+
+1. `Pid` / `Tid` / `Pgid` / `Sid` — 理解四类标识符的类型区分
+2. `TaskInfo` — 进程元信息的字段含义
+3. `ThdCtx` — 上下文切换的寄存器快照机制
+4. `Task::fork_task()` — 核心：子进程创建时哪些字段被复制、哪些被重置
+5. `TaskTable::alloc_pid()` / `insert()` — pid 分配与注册的生命周期
+6. `CapSet` — 理解 capability 权限检查的三集语义
+7. `ProcInit::build_init_stack()` — init 进程的用户态栈是如何被构造出来的

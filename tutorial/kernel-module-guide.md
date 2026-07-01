@@ -779,3 +779,128 @@ kernel.rs (编排层)
 5. **do_fork 不复制内存**：当前 fork 只复制了 vm_token（brk 地址），没有实际复制物理页——这不符合写时复制 (COW) 语义
 6. **SYS_FORK 的内存检查不完整**：检查了 `_mem_pressure` 和 `_child_copy_cost`，但没有实际分配内存给子进程
 7. **信号处理简化**：`SYS_SIGACTION` 只允许 SIGKILL 和 SIGSTOP 的 sigaction，其他信号都返回 "einval"
+
+---
+
+## 十五、宏观视角：kernel.rs 的整体架构
+
+kernel.rs 是混沌内核的**中枢调度器**，所有系统调用在此汇聚，由 `Kernel` 结构体统一协调各子系统完成任务。
+
+### 15.1 整体分层图
+
+```
+                   ┌─────────────────────────────────────────┐
+   用户态 trap →   │  Kernel.tick()  时钟滴答 + GKL 守护     │
+                   └──────────────────┬──────────────────────┘
+                                      │
+         ┌────────────────────────────┴─────────────────────────────┐
+         │                 dispatch_syscall (核心分发器)              │
+         │  按编号路由到 30+ 个系统调用的实现逻辑                       │
+         └────┬───────┬───────┬─────────┬──────────┬───────────┬───┘
+              │       │       │         │          │           │
+    ┌─────────┴─┐ ┌───┴───┐ ┌─┴────┐ ┌──┴────┐ ┌───┴────┐ ┌───┴─────┐
+    │  文件/IO  │ │ 内存  │ │ 进程 │ │ 信号  │ │  IPC   │ │ Epoll   │
+    │ read/write│ │ mmap  │ │ fork │ │signal │ │ sem/shm│ │ epoll_* │
+    │ open/close│ │ munmap│ │ exec │ │sigproc│ │        │ │         │
+    │ stat/fcntl│ │ brk   │ │ wait │ │mask   │ │        │ │         │
+    │ dup/pipe  │ │ alloc │ │ exit │ │       │ │        │ │         │
+    │ ioctl     │ │ pages │ │ kill │ │       │ │        │ │         │
+    └───────────┘ └───────┘ └──────┘ └───────┘ └────────┘ └─────────┘
+         │           │        │          │          │          │
+         ▼           ▼        ▼          ▼          ▼          ▼
+    ┌──────────────────────────────────────────────────────────────┐
+    │                    子系统层 (kernel-refactored/src)            │
+    │  fs.rs │ memory.rs │ process.rs │ signal.rs │ ipc.rs │ …     │
+    └──────────────────────────────────────────────────────────────┘
+```
+
+### 15.2 核心子系统职责一览
+
+| 子系统 | 对应 syscall | 核心职责 |
+|--------|--------------|----------|
+| **文件 / IO** | read, write, open, close, stat, fstat, dup, dup2, pipe, ioctl, fcntl | 文件描述符操作、路径解析、终端 I/O |
+| **内存管理** | mmap, munmap, brk, alloc_pages, free_pages | 虚拟/物理内存映射、堆扩展、页帧分配 |
+| **进程生命周期** | fork, exec, exit, wait4, kill, getpid, getppid | 创建/替换/终止进程，等待子进程 |
+| **进程组 / 会话** | setpgid, getpgid, setsid | 进程组与会话管理 |
+| **信号** | sigaction, sigprocmask | 信号注册与屏蔽集管理 |
+| **IPC** | (内部) get_sem, get_shm | System V 信号量与共享内存访问 |
+| **Epoll** | epoll_create, epoll_ctl, epoll_wait | 高效 I/O 多路复用 |
+| **Futex** | futex | 用户态快速互斥锁支持 |
+| **时钟** | clock_gettime | 系统时钟查询 |
+
+### 15.3 核心接口清单（按职责分组）
+
+**系统调用入口**
+- `dispatch_syscall(nr, args) -> Result<...>` — 唯一的 syscall 分发点，按编号路由
+
+**进程生命周期（高层操作）**
+- `do_fork(cur_pid) -> Result<Pid>` — 创建子进程（复制 Task 结构）
+- `do_exec(pid, path) -> Result<()>` — 替换进程映像（关闭 cloexec fd）
+- `do_wait(pid, status_ptr) -> Result<Pid>` — 等待子进程退出，回收僵尸
+- `do_pipe(pid) -> Result<(fd_r, fd_w)>` — 创建匿名管道
+
+**内存管理**
+- `alloc_pages(pid, npages) -> Result<usize>` — 为进程分配物理页
+- `free_pages(pid, addr, npages) -> Result<()>` — 释放进程物理页
+- `memory_pressure() -> usize` — 查询当前内存压力水位
+- `cache_stats() -> (usize, usize)` — 查询页缓存命中率统计
+
+**调度与回收**
+- `tick()` — 时钟中断入口，驱动调度器 + GKL 守护 + 僵尸回收
+- `schedule_tick()` — 单步调度：选出下一个可运行任务并切换
+- `balance_load()` — 跨 CPU 负载均衡（迁移任务到空闲核）
+- `reclaim_zombies()` — 扫描并回收已退出的僵尸进程
+
+**路径与文件系统**
+- `lookup_path(pid, path) -> Result<INode>` — 从进程 cwd 出发解析绝对/相对路径
+
+**终端 I/O**
+- `tty_push(data)` / `tty_pop() -> Option<u8>` — 内核 TTY 缓冲区读写
+
+**中断与异常**
+- `handle_pgfault(addr) -> Result<()>` — 缺页异常处理（触发 COW / 分配）
+- `handle_pgfault_ext(pid, addr) -> Result<()>` — 带进程上下文的缺页处理
+
+**IPC 访问**
+- `get_sem(key) -> Result<&SemCtx>` — 获取 System V 信号量上下文
+- `get_shm(key) -> Result<&ShmCtx>` — 获取 System V 共享内存上下文
+
+**线程**
+- `spawn_thread(pid, entry) -> Result<Tid>` — 在指定进程内创建新线程
+
+### 15.4 核心数据流：一次 read 系统调用
+
+```
+用户态 SYS_READ(fd, buf, len)
+    │
+    ▼
+dispatch_syscall(SYS_READ, ...)
+    │
+    ├─ 检查 buf 地址合法性（用户空间范围）
+    │
+    ├─ cur_task() → 获取当前 Task
+    │
+    ├─ task.fdt.lock() → 查 FDT 找到 FHandle
+    │
+    ├─ fhandle.read(buf, len)
+    │     └─ 内部：VFS → InodeTable → 对应 Inode 的 read()
+    │
+    └─ 返回实际读取字节数 (isize)
+```
+
+### 15.5 设计亮点
+
+1. **单 struct 集中调度**：Kernel 是唯一的中枢，所有 syscall 在此路由，避免了分散的多入口设计
+2. **GKL（全局内核锁）保护**：`tick()` 持有 GKL 期间完成调度、缓存清理和僵尸回收，简化了并发正确性
+3. **路径解析与 VFS 解耦**：`lookup_path` 将路径字符串解析为 Inode，与底层文件系统实现分离
+4. **内存压力感知**：`memory_pressure()` 让调度器在内存紧张时可以触发回收或拒绝新分配
+5. **do_fork / do_exec / do_wait 三件套**：清晰分离了"创建-替换-回收"三个阶段，符合 Unix 进程模型
+
+### 15.6 建议阅读顺序
+
+1. `Kernel::new()` — 了解内核初始化时注册了哪些子系统
+2. `tick()` / `schedule_tick()` — 理解时间片驱动的调度循环
+3. `dispatch_syscall` 中的 `SYS_READ` / `SYS_WRITE` — 最简单的 syscall 路径
+4. `do_fork` → `do_exec` → `do_wait` — 进程完整生命周期
+5. `handle_pgfault` — 缺页异常如何触发内存分配
+6. `balance_load` / `reclaim_zombies` — 后台维护机制

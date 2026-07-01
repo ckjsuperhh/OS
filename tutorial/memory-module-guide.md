@@ -1080,3 +1080,119 @@ memory.rs
 6. **heap_grow 合并策略有限**：只与最后一块尝试合并，可改进为对所有已获取块做全局合并
 7. **缺少 NUMA 感知**：ZoneInfo 虽然分区了物理内存，但未考虑 NUMA 节点的 locality
 8. **Ordering::Relaxed 的安全性**：大量使用 Relaxed 内存序，在弱一致性架构（如 RISC-V）上可能需要加强
+
+---
+
+## 十八、宏观视角：memory.rs 的整体架构
+
+把整个内存子系统想象成一台机器，自下而上分 **5 层基础设施**，外加 **3 个特殊机制**和 **1 组维护工具**。
+
+### 18.1 五层基础设施（自下而上）
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ Layer 5: 进程地址空间    VmMap (每进程一张映射表)                │ ← 进程视角
+├────────────────────────────────────────────────────────────────┤
+│ Layer 4: 虚拟内存区域    VmRegion (一段连续 VMA)                 │ ← 区域管理
+├────────────────────────────────────────────────────────────────┤
+│ Layer 3: 分区水位管理    ZoneInfo (内存分区 + 水位线)             │ ← NUMA 雏形
+├────────────────────────────────────────────────────────────────┤
+│ Layer 2: 物理帧分配      FramePool + frame_alloc/dealloc         │ ← 物理资源核心
+│                           BuddyAllocator (2^k 大块分配)          │
+├────────────────────────────────────────────────────────────────┤
+│ Layer 1: 物理页帧描述    PgFrame (引用计数，COW 的底座)           │ ← 物理页元数据
+├────────────────────────────────────────────────────────────────┤
+│ Layer 0: 地址翻译        p2v / v2p / k_off (线性映射)            │ ← 硬件抽象
+└────────────────────────────────────────────────────────────────┘
+```
+
+**每层的核心职责（一句话版）：**
+
+| 层 | 结构体 / 函数 | 解决什么问题 |
+|---|---|---|
+| **L0 地址翻译** | `p2v` / `v2p` / `k_off` | 内核虚拟地址 = 物理地址 + 偏移（`KERNBASE`），最简单的线性映射 |
+| **L1 物理页帧** | `PgFrame { rc: AtomicUsize }` | 每个物理页一个描述符，**引用计数**是 COW 的基础 |
+| **L2 帧分配** | `FramePool` + `frame_alloc/dealloc/alloc_contig` + `BuddyAllocator` | 位图分配器 + 时钟扫描回收 + 伙伴系统处理大块连续分配 |
+| **L3 分区** | `ZoneInfo` | 把物理内存切成分区（类似 Linux 的 DMA/NORMAL/HIGH），带水位线告警 |
+| **L4 虚拟区域** | `VmRegion` | 进程地址空间里的一段 VMA：起始、长度、权限、文件/匿名、可分割合并 |
+| **L5 地址空间** | `VmMap` | 每个进程一张 VMA 有序列表，管理该进程能"看到"的所有内存 |
+
+### 18.2 三个特殊机制（架在五层之上）
+
+| 机制 | 结构 | 用途 |
+|---|---|---|
+| **共享页 / COW** | `SharedPage` | fork 时父子共享物理页，写时才拷贝（写时复制） |
+| **内核栈** | `KStk` | 每个进程的内核态栈，构造时分配、Drop 时自动回收 |
+| **Slab 分配器** | `SlabEntry` | 固定大小对象（如 Task、File 结构）的高速缓存分配器 |
+
+### 18.3 对外暴露的接口清单（按层分类）
+
+#### L0 地址翻译
+- `p2v(pa)` / `v2p(va)` / `k_off(va)`
+
+#### L1 物理页帧
+- `PgFrame::new()` / `inc()` / `dec()` / `count()` / `is_unique()`
+
+#### L2 帧分配（核心接口）
+- `FramePool::new(cap)` / `alloc()` / `dealloc(target)` / `alloc_contig(sz, align)` / `remaining()`
+- `frame_alloc(pool)` / `frame_dealloc(pool, target)` / `frame_alloc_contig(pool, sz, align)` —— 独立函数版本
+- `BuddyAllocator::new(cap)` / `alloc(order)` / `dealloc(addr, order)`
+
+#### L3 分区
+- `ZoneInfo::new(name, start, len)` / `mark_used(off)` / `mark_free(off)` / `low()` / `critical()` / `usage()`
+
+#### L4 虚拟区域
+- `VmRegion::new(start, len, flags)` / `split(at)` / `merge(other)` / `contains(addr)` / `flags_*()` 等
+- 支持匿名 / 文件映射 / 共享 / COW 多种类型标志
+
+#### L5 进程地址空间
+- `VmMap::new()` / `map(start, len, flags)` / `unmap(start, len)` / `find(addr)` / `fork()` / `page_fault(addr)`
+
+#### 特殊机制
+- `SharedPage::new(frame)` / `acquire()` / `cow_fault()` —— COW 缺页处理
+- `KStk::new(pool)` / `base()` / `Drop` 自动回收
+- `SlabEntry::new(obj_sz)` / `alloc()` / `dealloc(ptr)` —— 固定大小对象池
+- `heap_init` / `heap_grow` —— 内核堆
+
+#### 维护工具
+- `defragment_frame_pool(slots)` / `verify_page_alignment(addr, order)` / `compute_rss_watermark(regions, cap)` / `log2_floor(v)`
+
+### 18.4 核心数据流（进程怎么用内存）
+
+```
+用户态 malloc(4KB)
+    │
+    ▼ sys_brk / mmap
+VmMap::map()  ──→  找一个空洞 VmRegion ──→ 插入到 VmMap 有序列表
+    │                                         (此时还没分配物理页)
+    ▼ 用户写这块内存 → 触发缺页异常
+VmMap::page_fault(addr)
+    │
+    ▼ 找 VmRegion 判断类型
+    ├─ 匿名页 → frame_alloc(pool) → 拿到物理帧 → PgFrame::new() → 写入页表
+    ├─ 文件映射 → 从 fs 读内容 → 写入新物理帧
+    └─ COW 共享 → SharedPage::cow_fault() → 拷贝一份新物理帧 → 替换页表
+    
+    ▼ 进程退出
+VmMap::drop → 每个 VmRegion unmap → 物理帧 PgFrame::dec()
+                                     ↓ 引用计数归 0
+                                FramePool::dealloc() 回收
+```
+
+### 18.5 设计上的几个亮点
+
+1. **FramePool 用位图 + 时钟扫描**：不是简单的 first-fit，而是时钟扫描（二次机会算法），兼顾命中率和扫描成本
+2. **BuddyAllocator 和 FramePool 共存**：FramePool 管单页，Buddy 管 2^k 大块，互为补充
+3. **PgFrame 的引用计数是 COW 的命根子**：fork 时父子共享同一个物理页、rc=2；任何一方写入时 rc=2 → 拷贝新页、rc 分别归 1
+4. **VmMap 是有序列表不是红黑树**：小规模进程下线性扫描够用；Linux 用红黑树是为了应对大地址空间
+5. **KStk 用 RAII 自动回收**：`Drop` 里调用 `frame_dealloc`，进程死了一定会释放内核栈，不会泄漏
+6. **Slab 分配器是"对象缓存"思路**：内核里 Task、File、VMA 这些高频小对象走 Slab，不走通用堆，避免碎片
+
+### 18.6 建议阅读顺序
+
+1. **先 L0 → L1 → L2**（底层基础设施，从 `p2v` 开始，顺着看 `FramePool`）
+2. **然后 L4 → L5**（虚拟内存视角，`VmRegion` → `VmMap`）
+3. **再回头看 L3**（`ZoneInfo` 是辅助性的，理解分区水位即可）
+4. **最后看特殊机制**（`SharedPage` / `KStk` / `Slab` 相对独立）
+
+这样能先建立"物理内存从哪来"的认知，再理解"进程怎么用虚拟内存"，最后看"特殊场景的优化"。
