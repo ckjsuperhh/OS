@@ -149,71 +149,42 @@ impl Channel {
     /// 缓冲区有数据 → 立即返回 Some(byte)
     /// 缓冲区空且未关闭 → 休眠等待，被 send/close 唤醒后重试
     /// 通道已关闭 → 返回 None (EOF)
+    // [BUG-21] 修复 recv 丢失唤醒：用循环重试 + park 前二次检查，避免虚假唤醒或并发 send/close 导致永久阻塞
     pub fn recv(&self) -> Option<u8> {
-        // 阶段 1：获取 guard 自旋锁（CAS 忙等，串行化读者）
         loop {
-            if self.guard.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() { 
-                // 如果锁状态等于预期 false ，改成 true ，拿到锁，直接跳出循环；如果为 true ，就直接开始等
+            // 阶段 1：获取 guard 自旋锁（CAS 忙等，串行化读者）
+            while self.guard.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                // 如果锁状态等于预期 false，改成 true，拿到锁；否则忙等
                 core::hint::spin_loop(); // CPU pause 指令，缓解忙等压力
+            }
+
+            // 阶段 2：锁 buf，尝试读取（rd 指向的位置）
+            let mut ring = self.buf.lock().unwrap();
+            if let Some(v) = ring.pop() {
+                self.guard.v.store(false, Ordering::Release);
+                return Some(v);
+            }
+
+            // 阶段 3：缓冲区空，检查是否已关闭
+            if self.shut.load(Ordering::Acquire) {
+                self.guard.v.store(false, Ordering::Release);
+                return None;
+            }
+
+            // 阶段 4：需要休眠等待。先释放 buf 和 guard，再注册到等待队列
+            drop(ring);
+            self.guard.v.store(false, Ordering::Release);
+            let mut wq = self.wq.q.lock().unwrap();
+            wq.push_back(thread::current());
+            drop(wq);
+
+            // 阶段 5：注册后到 park 前再次检查状态，避免在此间隙收到 send/close 后丢失唤醒
+            if self.shut.load(Ordering::Acquire) || !self.buf.lock().unwrap().empty() {
                 continue;
             }
-            break;
+            thread::park(); // 休眠，直到 send()/close() 调用 unpark（也可能虚假返回）
+            // 被唤醒后回到循环顶部重新竞争 guard 并读取
         }
-        // 自旋锁约束只能有一个读者进入，而 Mutex<CircBuf> 约束对于 CircBuf 读写的互斥
-
-        // 阶段 2：锁 buf，第一次尝试读取（rd 指向的位置）
-        let result = {
-            let mut ring = self.buf.lock().unwrap();
-            ring.pop()
-        };
-
-        // 读到了 → 释放 guard 并返回
-        if result.is_some() {
-            self.guard.v.store(false, Ordering::Release);
-            return result;
-        }
-
-        // 阶段 3：缓冲区空，检查是否已关闭
-        if self.shut.load(Ordering::Relaxed) {
-            self.guard.v.store(false, Ordering::Release);
-            return None;
-        }
-
-        // 阶段 4：注册到等待队列并休眠
-        {
-            let data_ref = &self.buf;
-            {
-                let d = data_ref.lock().unwrap();
-                if !d.empty() {
-                    // 在我们检查关闭状态期间有人写入了，不休眠，直接重试（进入下一阶段）
-                    drop(d);
-                } else {
-                    drop(d);
-                    self.guard.v.store(false, Ordering::Release); // 释放 guard
-                    // 将当前线程加入等待队列
-                    let mut wq = self.wq.q.lock().unwrap();
-                    wq.push_back(thread::current());
-                    drop(wq);
-                    thread::park(); // 休眠，直到 send()/close() 调用 unpark
-                    // 被唤醒后重新获取 guard
-                    loop {
-                        if self.guard.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                            core::hint::spin_loop();
-                            continue;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
-        // 阶段 5：第二次尝试读取（被唤醒后）
-        let v = {
-            let mut ring = self.buf.lock().unwrap();
-            ring.pop()
-        };
-        self.guard.v.store(false, Ordering::Release);
-        v
     }
 
     // 多个生产者本来就要靠 buf 的 Mutex 天然串行排队，并发写本身就会被内核互斥锁限流，不会出现大规模瞬间唤醒争抢锁的惊群现象

@@ -26,6 +26,7 @@
 | Util | `util.rs` | Session 9（BUG-17 check_access_rw 三层校验实现 + cfu 死代码清理）已完成 |
 | Kernel | `kernel.rs` | Session 10（BUG-19 tick() 手动 GKL 原子操作替换为 enter/leave）已完成 |
 | FS | `fs.rs` | Session 11（新增 configFS 伪文件系统 + FLike::Config + demo 子系统）已完成 |
+| Channel / Workspace | `channel.rs` / `Cargo.toml` | Session 12（BUG-21/22 修复 CI 失败：Channel recv 丢失唤醒 + 原始测试包被误识别为 workspace 成员）已完成 |
 
 ---
 
@@ -380,6 +381,51 @@
   → 36/36 测试全过（33 个原有测试 + 3 个新增 group_12）。
 
 - **标记**：`fs.rs` / `kernel.rs` 中 configFS 相关位置标注 `[BUG-20]`。
+
+---
+
+## Session 12 — 修复 GitHub Actions CI 失败
+
+**Date**: 2026-07-02
+**Module**: `channel.rs` / `Cargo.toml`
+
+#### BUG-21: Channel::recv() 丢失唤醒导致 `basic_pipe_ipc_workload` 在 CI 中超时（已修复）
+
+- **问题**：`Chaos Tests / Refactored kernel tests` 在 CI 中偶发失败，`group_11::basic_pipe_ipc_workload` 报 `assertion failed: ok`（即 3 秒超时）。本地稳定复现不出。
+- **根因分析**：
+  - 原 `recv()` 只在第一次 `park()` 后读取一次；`thread::park()` 允许虚假返回，也可能在 send/close 与 park 之间发生，导致消费者错误地返回 `None`。
+  - 一旦消费者提前退出，缓冲区不再被消费，生产者 `while !ch_prod.send(i) { yield_now(); }` 会在缓冲区满后永远自旋，最终触发 `run_with_timeout` 超时。
+- **修复**：将 `recv()` 重写为循环：
+  - 获取 reader guard → 尝试 `ring.pop()`；
+  - 若空则检查 `shut`，已关闭返回 `None`；
+  - 否则释放 guard/buf，将当前线程加入 `wq`，并在真正 `park()` 前二次检查 `shut` / `buf.empty()`；
+  - 被唤醒或虚假返回后回到循环顶部重试。
+- **影响**：`Channel::recv`。
+- **标记**：`channel.rs` 中 `recv()` 附近标注 `[BUG-21]`。
+
+#### BUG-22: 根 `Cargo.toml` workspace 未排除原始测试包，导致 `cargo test` 报错（已修复）
+
+- **问题**：`Chaos Tests / Original kernel tests` 直接失败：
+  ```
+  current package believes it's in a workspace when it's not:
+  current:   .../chaos-tests/Cargo.toml
+  workspace: .../Cargo.toml
+  ```
+  根 workspace 的 `members` 只包含 `kernel-refactored` / `chaos-tests-refactored`，`kernel` 和 `chaos-tests` 不是成员，但也不是 `exclude`，Cargo 拒绝从这两个目录独立运行。
+- **修复**：在根 `Cargo.toml` 增加 `exclude = ["kernel", "chaos-tests"]`，让原始内核包作为独立 package 构建。
+- **影响**：`Cargo.toml`。
+
+#### 验证结果
+
+```bash
+# 从 repo 根目录
+cargo test --workspace --test basic
+# → 36/36 通过（refactored）
+
+# 从 chaos-tests 目录
+cargo test --test basic
+# → 33/33 通过（original）
+```
 
 ---
 
