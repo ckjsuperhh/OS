@@ -21,6 +21,7 @@
 | Channel | `channel.rs` | CircBuf 和 Channel 已完成重构；Session 2（BUG-06 API 委托）已完成；Session 3（BUG-07 关闭检查）已完成 |
 | Signal | `signal.rs` | Session 4（BUG-08/09/10 信号集合操作优化）已完成 |
 | Sync | `sync.rs` | Session 5（BUG-11 KernLock::leave() 移除无用原子读）已完成；Session 6（BUG-13 FutexBucket/FutexTable 哈希桶改造、BUG-14 SyncQueue 三处冗余与语义修复）已完成 |
+| Ipc | `ipc.rs` | Session 7（BUG-15 SemArr otime/ctime 改为真实 Unix 时间戳）已完成 |
 
 ---
 
@@ -213,6 +214,26 @@
    拿到 true 时 pred 实际并未满足，属于虚假成功，已被否决。）
 - **验证**：33/33 测试全过。
 - 详见 `sync.rs` 中 `impl SyncQueue` 后的 `[BUG-14]` 注释块。
+
+---
+
+## Session 7 — SemArr 时间戳改为真实时钟
+
+**Date**: 2026-07-01
+**Module**: ipc.rs
+
+#### BUG-15: SemArr otime_now/ctime_now 占位 0 → 真实 Unix 时间戳（已修复）
+
+- **问题**：`SemArr::otime_now()` 与 `ctime_now()` 原本写入 0 作为占位，
+  导致用户态通过 `semctl(IPC_STAT)` 读到的"最后 semop 时间 / 最后属性修改时间"
+  永远是 0，无法反映真实操作历史。
+- **修复**：
+  1. 新增 `now_secs()` 辅助函数：
+     `SystemTime::now().duration_since(UNIX_EPOCH).as_secs() as usize`
+  2. `otime_now` / `ctime_now` 改为写入 `now_secs()` 的真实 Unix 时间戳（秒）
+  3. 失败时（系统时钟早于 UNIX_EPOCH，正常不该发生）兜底回 0
+- **验证**：33/33 测试全过。
+- 详见 `ipc.rs` 中 `impl SemArr` 后的 `[BUG-15]` 注释块。
 
 ---
 

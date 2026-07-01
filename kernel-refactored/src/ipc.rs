@@ -1,6 +1,6 @@
 //! System V IPC 模块：信号量（semaphore）和共享内存（shared memory）。
 //!
-//! 本模块实现内核中的进程间通信（IPC）机制：
+//! 本模块实现内核中的进程间通信（IPC,Inter-Process Communication）机制：
 //! - **IpcPerm**：SysV IPC 权限结构（key、uid、gid、mode 等）
 //! - **SemDs**：信号量数组描述符（权限 + 时间戳 + 数量）
 //! - **SemArr**：信号量数组，带 Index trait 和 get_or_create 工厂方法
@@ -13,9 +13,20 @@
 use std::collections::BTreeMap;
 use std::ops::Index;
 use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::consts::*;
 use crate::sync::Sema;
+
+/// 读取当前时刻的 Unix 时间戳（秒），作为 otime / ctime 的写入值。
+/// 失败时（系统时钟早于 UNIX_EPOCH，正常不该发生）返回 0 兜底。
+#[inline]
+fn now_secs() -> usize {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as usize)
+        .unwrap_or(0)
+}
 
 // ==================== 类型别名 ====================
 
@@ -28,7 +39,7 @@ type ShmId = usize;   // 共享内存段 ID
 // ==================== IpcPerm — SysV IPC 权限结构 ====================
 
 /// SysV IPC 权限结构，对应 Linux 的 struct ipc_perm。
-/// 使用 #[repr(C)] 保证与 C 语言的内存布局兼容。
+/// 使用 #[repr(C)] 强制内存布局和 C 语言 struct ipc_perm 一模一样，方便用户态 / 内核交互、兼容传统 SysV IPC；
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct IpcPerm {
@@ -76,10 +87,10 @@ impl Index<usize> for SemArr {
 impl SemArr {
     /// 销毁数组中所有信号量（标记为已移除，唤醒所有等待者）
     pub fn remove(&self) { for s in &self.sems { s.remove(); } }
-    /// 更新 otime 为当前时间（简化实现：设为 0 占位）
-    pub fn otime_now(&self) { self.ds.lock().unwrap().otime = 0; }
-    /// 更新 ctime 为当前时间（简化实现：设为 0 占位）
-    pub fn ctime_now(&self) { self.ds.lock().unwrap().ctime = 0; }
+    /// 更新 otime（最后一次 semop 操作的时间戳）为当前时刻（Unix 秒）
+    pub fn otime_now(&self) { self.ds.lock().unwrap().otime = now_secs(); }
+    /// 更新 ctime（最后一次属性修改的时间戳）为当前时刻（Unix 秒）
+    pub fn ctime_now(&self) { self.ds.lock().unwrap().ctime = now_secs(); }
     /// 更新描述符的权限字段（uid、gid、mode），mode 被掩码限制为低 9 位
     pub fn set_ds(&self, new: &SemDs) {
         let mut l = self.ds.lock().unwrap();
@@ -97,10 +108,10 @@ impl SemArr {
     ///
     /// 全局 store 使用 Weak 引用，避免阻止 SemArr 被释放
     pub fn get_or_create(
-        key: u32,
-        nsems: usize,
-        flags: usize,
-        store: &RwLock<BTreeMap<u32, Weak<SemArr>>>,
+        key: u32, // 全局 IPC 键（用户 ftok 生成，key=0 代表私有信号量）
+        nsems: usize,  // 要创建的一组信号量数量
+        flags: usize,  // 创建标志（IPC_CREAT、IPC_EXCL）
+        store: &RwLock<BTreeMap<u32, Weak<SemArr>>>,  // 内核全局信号量仓库
     ) -> Result<Arc<Self>, &'static str> {
         let mut m = store.write().unwrap();
         let mut k = key;
@@ -132,11 +143,19 @@ impl SemArr {
         Ok(arr)
     }
 }
+// ── BUG-15（SemArr 时间戳占位符）───────────────────────────────────
+// otime_now() 与 ctime_now() 原本写入 0 作为占位，导致用户态通过 semctl(IPC_STAT)
+// 读到的"最后 semop 时间 / 最后属性修改时间"永远是 0，无法反映真实操作历史。
+// 修复：
+//   - 新增 now_secs() 辅助函数：SystemTime::now().duration_since(UNIX_EPOCH).as_secs()
+//   - otime_now / ctime_now 改为写入 now_secs() 的真实 Unix 时间戳（秒）
+//   - 失败时（系统时钟早于 UNIX_EPOCH，正常不该发生）兜底回 0
+// ────────────────────────────────────────────────────────────────
 
 // ==================== SemCtx — 每进程信号量上下文 ====================
-
-/// 每进程的信号量上下文，记录进程关联的所有信号量数组和撤销操作表。
-/// undos 实现 SEM_UNDO 语义：进程退出时自动撤销（释放）已获取的信号量，防止死锁。
+// SemCtx 记录进程持有的多套信号量集合，通过本地 SemId 快速索引全局共享的 SemArr。
+// undos 存储 SEM_UNDO 撤销操作，进程退出自动回滚信号量占用。
+// 全局角度可能有大量 SemArr ，内核全局维护一张映射 key → Weak<SemArr>，每套 SemArr 内部又包含多个独立计数信号量（sems[0]、sems[1]...），一套里就能做多资源同步。
 #[derive(Default)]
 pub struct SemCtx {
     /// 该进程已关联的信号量数组：SemId → Arc<SemArr>
@@ -193,6 +212,7 @@ impl Drop for SemCtx {
 
 /// 共享内存标记：记录一段共享内存在进程中的映射信息。
 /// pages 通过 Arc 共享——多个进程的 ShmTag 指向同一块物理内存。
+/// ShmTag 是进程私有的，全局只有 Page 是公有的，而进程内部通过 addr 链接对应的 Page。
 #[derive(Clone)]
 pub struct ShmTag {
     pub addr: usize,                       // 映射到进程地址空间的虚拟地址
