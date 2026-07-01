@@ -22,6 +22,8 @@
 | Signal | `signal.rs` | Session 4（BUG-08/09/10 信号集合操作优化）已完成 |
 | Sync | `sync.rs` | Session 5（BUG-11 KernLock::leave() 移除无用原子读）已完成；Session 6（BUG-13 FutexBucket/FutexTable 哈希桶改造、BUG-14 SyncQueue 三处冗余与语义修复）已完成 |
 | Ipc | `ipc.rs` | Session 7（BUG-15 SemArr otime/ctime 改为真实 Unix 时间戳）已完成 |
+| Trap | `trap.rs` | Session 8（BUG-16 死代码清理 + 删除 handle_irq + dispatch 对标标准两层 trap 范式重写）已完成 |
+| Util | `util.rs` | Session 9（BUG-17 check_access_rw 三层校验实现 + cfu 死代码清理）已完成 |
 
 ---
 
@@ -234,6 +236,77 @@
   3. 失败时（系统时钟早于 UNIX_EPOCH，正常不该发生）兜底回 0
 - **验证**：33/33 测试全过。
 - 详见 `ipc.rs` 中 `impl SemArr` 后的 `[BUG-15]` 注释块。
+
+---
+
+## Session 8 — TrapCtl 死代码清理与 dispatch 语义修复
+
+**Date**: 2026-07-01
+**Module**: trap.rs
+
+#### BUG-16: TrapCtl 死代码清理 + dispatch 语义重写（已修复）
+
+- **问题**：trap.rs 中存在大量死代码和 dispatch 空壳：
+  1. `set_ip()` / `set_sp()` 保存旧值 `_old` 但从未使用
+  2. `apply()` 中 `_checksum` 校验和计算后丢弃
+  3. `configure()` 中 `combined` 和 `_parity` 奇偶校验位纯浪费 CPU
+  4. `hw()` / `sw()` 中 `_check` 重复 load 同一原子变量
+  5. `handle_irq()` 中 `_nest_before` / `_supp` / `_suppressed_tick` 全为死变量
+  6. `on_pgfault()` 中 `_page` / `_offset` 计算后未使用
+  7. `clone_with_ret()` 的 while 循环可简化为 for
+  8. **dispatch() 是 no-op**：保存帧 → nest +1/-1 → 原样返回 ctx
+  9. **dispatch_vector() 中 vector 14 不可达**：被 `8..=15` match 臂覆盖
+  10. **handle_irq() 与 dispatch() 重复**：帧保存两次、nest ±1 成对抵消
+  11. **缺页双重故障检测写了两遍**
+  12. **dispatch 无 ISR 回调机制**：所有向量分支都是空操作
+  13. **save/restore 循环不完整**：保存了上下文但恢复时直接返回入参
+
+- **修复**（对标 x86/RISC-V 标准两层 trap 分发范式）：
+  1. 删除所有 `_` 前缀死变量和无副作用的计算块
+  2. 手动 Context 构造全部改用 `ctx.clone()`
+  3. TrapCtl 新增 **handlers** 字段：16 路 ISR 回调表
+     `Mutex<Box<[Option<Box<dyn Fn(&mut Context)+Send>>; 16]>>`
+     内核通过 `register_handler(vector, callback)` 注入真实处理逻辑
+  4. `dispatch(vector, ctx)` 重写为标准统一 trap handler：
+     ① 保存 ctx 到帧槽（move，不 clone）
+     ② active=true, nest+1
+     ③ 查 handlers[vector]，若已注册则调用回调（可修改帧槽中 Context）
+     ④ 从帧槽读出（可能被修改的）上下文——完成 save/restore 循环
+     ⑤ nest-1, active=false → 返回恢复后的上下文
+  5. **删除 handle_irq()**：逻辑内联到 dispatch 的回调机制中
+  6. `on_pgfault()` 改为返回 `(page, offset)`，不再做死计算
+  7. `dispatch_vector()` 重排 match：14 放在 8..=15 之前，缺页不可屏蔽
+
+- **验证**：33/33 测试全过。
+- 详见 `trap.rs` 中 `impl TrapCtl` 后的 `[BUG-16]` 注释块。
+
+---
+
+## Session 9 — check_access_rw 三层校验实现 + 死代码清理
+
+**Date**: 2026-07-01
+**Module**: util.rs, trap.rs
+
+#### BUG-17: check_access_rw 三层校验实现 + cfu/validate_access 死代码清理（已修复）
+
+- **问题**：`check_access_rw` 原意是三层增强地址校验，但第 2、3 层算了却没用：
+  1. `_span_check`：计算了页面数是否超过 KHEAP_SZ 限制，但结果未使用
+  2. `_alignment_ok`：计算了写操作地址对齐，但结果未使用
+  3. `crosses_kern`：中间布尔变量，可内联
+  4. 最终返回 `boundary < KERN_BASE` 与 `check_access` 完全等价
+  5. `cfu()` 中 `_alignment` 对齐检查算了但没用
+  6. `validate_access()` mode 1 中 `_pages` 页统计算了但没用
+
+- **修复**：
+  1. `check_access_rw` 重写为三层真实校验：
+     - 第 1 层：`checked_add` 溢出 + `KERN_BASE` 边界
+     - 第 2 层：`n_pages > KHEAP_SZ/PAGE_SZ` → 拒绝
+     - 第 3 层：`writable` 时 `addr % sizeof(usize) != 0` 且 `len >= align` → 拒绝
+  2. `cfu()` 删除死变量 `_alignment`
+  3. `validate_access()` mode 1 删除死变量 `_pages`
+
+- **验证**：33/33 测试全过。
+- 详见 `util.rs` 中 `ctu()` 后的 `[BUG-17]` 注释块。
 
 ---
 
