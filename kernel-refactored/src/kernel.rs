@@ -36,6 +36,7 @@ pub struct Kernel {
     pub pool: FramePool,                                       // 物理页帧池：管理物理内存分配
     pub cpus: Mutex<[Option<Arc<Task>>; MAX_CPU]>,             // CPU 槽位数组：每个 CPU 当前运行的任务
     pub mnt: MountTable,                                       // 挂载表：文件系统挂载点管理
+    pub configfs: ConfigFS,                                    // configFS 配置伪文件系统
     pub sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,        // 信号量存储：key -> 信号量数组（弱引用）
     pub shm_store: RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>, // 共享内存存储：key -> 共享内存页（弱引用）
     pub tty_buf: Mutex<VecDeque<u8>>,                          // TTY 输入缓冲区
@@ -50,6 +51,7 @@ impl Kernel {
             pool: FramePool::new(nf),
             cpus: Mutex::new([None, None, None, None, None, None, None, None]),
             mnt: MountTable::new(),
+            configfs: ConfigFS::new(),
             sem_store: RwLock::new(BTreeMap::new()),
             shm_store: RwLock::new(BTreeMap::new()),
             tty_buf: Mutex::new(VecDeque::new()),
@@ -100,6 +102,25 @@ impl Kernel {
         }
     }
 
+    /// 读取当前任务指定 fd 的内容到用户缓冲区（地址参数模拟）
+    fn read_fd(&self, fd: usize, count: usize) -> Result<Vec<u8>, &'static str> {
+        let t = self.cur_task(0).ok_or("esrch")?;
+        let files = t.files.lock().unwrap();
+        let fl = files.get(&fd).ok_or("ebadf")?;
+        let mut buf = vec![0u8; count];
+        let n = fl.read(&mut buf)?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    /// 向当前任务指定 fd 写入数据
+    fn write_fd(&self, fd: usize, data: &[u8]) -> Result<usize, &'static str> {
+        let t = self.cur_task(0).ok_or("esrch")?;
+        let files = t.files.lock().unwrap();
+        let fl = files.get(&fd).ok_or("ebadf")?;
+        fl.write(data)
+    }
+
     /// 设置指定 CPU 上运行的任务（上下文切换时使用）
     pub fn set_cur(&self, cpu: usize, t: Option<Arc<Task>>) {
         let mut cg = self.cpus.lock().unwrap();
@@ -140,6 +161,9 @@ impl Kernel {
         root.threads.lock().unwrap().push(rid);
         let _kstk = KStk::new();
         *root.kstk.lock().unwrap() = Some(_kstk);
+        // 挂载 configFS 并注册 demo 子系统
+        self.mnt.bind("/config", "configfs");
+        self.configfs.register_subsystem(demo_config_subsystem());
     }
 
     /// TTY 输入：推入一个字节（\r 自动转换为 \n）
@@ -202,6 +226,11 @@ impl Kernel {
                 if count == 0 { return Ok(0); }
                 // 用户空间地址合法性检查
                 if !check_access(buf_addr, count) { return Err("efault"); }
+                // 对真实文件描述符（fd >= 3）委托给任务文件表
+                if fd >= 3 {
+                    let data = self.read_fd(fd, count)?;
+                    return Ok(data.len());
+                }
                 // 计算缓冲区跨越的页数
                 let page_start = buf_addr & !(PAGE_SZ - 1);
                 let page_end = (buf_addr + count) & !(PAGE_SZ - 1);
@@ -238,6 +267,12 @@ impl Kernel {
                 if buf_addr == 0 && count > 0 { return Err("efault"); }
                 if count == 0 { return Ok(0); }
                 if !check_access(buf_addr, count) { return Err("efault"); }
+                // 对真实文件描述符（fd >= 3）委托给任务文件表
+                if fd >= 3 {
+                    let data = vec![0u8; count];
+                    let n = self.write_fd(fd, &data)?;
+                    return Ok(n);
+                }
                 // 计算考虑页对齐后的实际写入长度
                 let page_off = buf_addr & (PAGE_SZ - 1);
                 let remaining_in_page = PAGE_SZ - page_off;
@@ -285,19 +320,27 @@ impl Kernel {
                 let _append = (flags & O_APPEND) != 0;
                 let _cloexec = (flags & O_CLOEXEC) != 0;
                 let _follow_sym = (flags & AT_NOFOLLOW) == 0;
-                // 挂载表查询：查找最长匹配的挂载点
-                let _resolved = {
-                    let tbl = self.mnt.entries.read().unwrap();
-                    let mut best_prefix_len = 0;
-                    let mut _target = String::new();
-                    for m in tbl.iter() {
-                        if m.prefix.len() > best_prefix_len {
-                            best_prefix_len = m.prefix.len();
-                            _target = m.target.clone();
+                // 使用路径字符串占位（真实系统需从用户空间拷贝）
+                let path = format!("/config/path_{}", path_addr);
+                let resolved = self.lookup_path(&path).unwrap_or_else(|_| path.clone());
+                // configFS 路径处理：configfs:subsys/.../item/attr
+                if resolved.starts_with("configfs:") {
+                    let sub_path = &resolved["configfs:".len()..];
+                    if let Ok(ConfigLookup::Attr(item, attr_name)) = self.configfs.lookup(sub_path) {
+                        let cur = self.cur_task(0);
+                        if let Some(t) = cur {
+                            let rd = _rdonly || _rdwr;
+                            let wr = _wronly || _rdwr;
+                            let opt = FdOpt { rd, wr, ap: _append, nb: _nonblock };
+                            let node = ConfigNode::new(item, &attr_name);
+                            let mut fl = FLike::Config(node);
+                            if let FLike::Config(ref mut c) = fl { c.offset = 0; }
+                            let fd = t.add_file(fl);
+                            return Ok(fd);
                         }
                     }
-                    best_prefix_len
-                };
+                    return Err("enoent");
+                }
                 // O_CREAT | O_EXCL：检查文件是否已存在
                 if _create && _excl {
                     let ci = path_addr % self.cache.width;
@@ -1379,4 +1422,31 @@ impl Kernel {
             }
         }
     }
+}
+
+/// 创建 configFS demo 子系统：counter
+/// 用户可在 /config/demo 下 mkdir 创建计数器 item，读写 value 属性
+pub fn demo_config_subsystem() -> ConfigSubsystem {
+    fn demo_show(item: &ConfigItem) -> String {
+        item.data.lock().unwrap()
+            .get("value").cloned().unwrap_or_else(|| "0".to_string())
+    }
+    fn demo_store(item: &ConfigItem, s: &str) -> Result<(), &'static str> {
+        s.parse::<i64>().map_err(|_| "einval")?;
+        item.data.lock().unwrap().insert("value".to_string(), s.to_string());
+        Ok(())
+    }
+    let counter_type = Arc::new(ConfigItemType {
+        name: "counter".to_string(),
+        attrs: vec![ConfigAttr {
+            name: "value".to_string(),
+            mode: 0o644,
+            show: demo_show,
+            store: demo_store,
+        }],
+        can_make_item: true,
+        can_make_group: false,
+        can_link: false,
+    });
+    ConfigSubsystem::new("demo", counter_type)
 }

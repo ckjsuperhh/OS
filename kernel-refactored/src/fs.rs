@@ -25,6 +25,227 @@ use crate::sync::{Spin, SyncQueue, EvBus, EvFlag, EvCb, GKL};
 use crate::channel::CircBuf;
 use crate::util::CLK;
 
+// ==================== configFS 伪文件系统 ====================
+
+/// configFS 属性描述：名称、权限、读写回调
+pub struct ConfigAttr {
+    pub name: String,
+    pub mode: u16,
+    pub show: fn(&ConfigItem) -> String,
+    pub store: fn(&ConfigItem, &str) -> Result<(), &'static str>,
+}
+
+/// configFS 项目类型：定义一类 item 有哪些属性和创建能力
+pub struct ConfigItemType {
+    pub name: String,
+    pub attrs: Vec<ConfigAttr>,
+    pub can_make_item: bool,
+    pub can_make_group: bool,
+    pub can_link: bool,
+}
+
+/// configFS 配置项：对应一个目录
+pub struct ConfigItem {
+    pub name: String,
+    pub item_type: Arc<ConfigItemType>,
+    pub data: Mutex<BTreeMap<String, String>>,
+}
+
+impl ConfigItem {
+    /// 创建新的配置项
+    pub fn new(name: &str, item_type: Arc<ConfigItemType>) -> Self {
+        Self {
+            name: name.to_string(),
+            item_type,
+            data: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+/// configFS 子节点：item 或 group
+#[derive(Clone)]
+pub enum ConfigChild {
+    Item(Arc<ConfigItem>),
+    Group(Arc<ConfigGroup>),
+}
+
+/// configFS 配置组：可以包含子 item / 子 group 的目录
+pub struct ConfigGroup {
+    pub item: ConfigItem,
+    pub children: Mutex<BTreeMap<String, ConfigChild>>,
+}
+
+impl ConfigGroup {
+    /// 创建新组
+    pub fn new(name: &str, item_type: Arc<ConfigItemType>) -> Self {
+        Self {
+            item: ConfigItem::new(name, item_type),
+            children: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+/// configFS 子系统：顶层注册单元
+pub struct ConfigSubsystem {
+    pub name: String,
+    pub root: Arc<ConfigGroup>,
+}
+
+impl ConfigSubsystem {
+    /// 创建新子系统
+    pub fn new(name: &str, root_type: Arc<ConfigItemType>) -> Self {
+        Self {
+            name: name.to_string(),
+            root: Arc::new(ConfigGroup::new(name, root_type)),
+        }
+    }
+}
+
+/// configFS 全局管理器
+pub struct ConfigFS {
+    pub subsystems: Mutex<BTreeMap<String, Arc<ConfigSubsystem>>>,
+}
+
+impl ConfigFS {
+    /// 创建空的 configFS
+    pub fn new() -> Self {
+        Self { subsystems: Mutex::new(BTreeMap::new()) }
+    }
+
+    /// 注册子系统
+    pub fn register_subsystem(&self, subsys: ConfigSubsystem) {
+        let mut s = self.subsystems.lock().unwrap();
+        s.insert(subsys.name.clone(), Arc::new(subsys));
+    }
+
+    /// 解析路径，返回找到的属性或目录节点
+    /// 路径格式: subsys/[group/...]item/attr
+    pub fn lookup(&self, path: &str) -> Result<ConfigLookup, &'static str> {
+        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        if parts.is_empty() { return Err("enoent"); }
+        let subsys_name = parts[0];
+        let subsys = {
+            let s = self.subsystems.lock().unwrap();
+            s.get(subsys_name).cloned()
+        };
+        let subsys = subsys.ok_or("enoent")?;
+        let mut current = subsys.root.clone();
+        let mut i = 1;
+        while i < parts.len() {
+            let name = parts[i];
+            let next = {
+                let children = current.children.lock().unwrap();
+                match children.get(name) {
+                    Some(ConfigChild::Group(g)) => Some(ConfigChild::Group(g.clone())),
+                    Some(ConfigChild::Item(item)) => {
+                        if i + 1 < parts.len() {
+                            let attr_name = parts[i + 1];
+                            for attr in &item.item_type.attrs {
+                                if attr.name == attr_name {
+                                    return Ok(ConfigLookup::Attr(item.clone(), attr_name.to_string()));
+                                }
+                            }
+                            return Err("enoent");
+                        } else {
+                            return Ok(ConfigLookup::Item(item.clone()));
+                        }
+                    }
+                    None => return Err("enoent"),
+                }
+            };
+            match next {
+                Some(ConfigChild::Group(g)) => { current = g; i += 1; }
+                _ => return Err("enoent"),
+            }
+        }
+        Ok(ConfigLookup::Group(current))
+    }
+
+    /// 在指定路径下 mkdir（创建子 item 或子 group）
+    pub fn mkdir(&self, path: &str, name: &str) -> Result<(), &'static str> {
+        let group = self.resolve_group(path)?;
+        let item_type = &group.item.item_type;
+        if item_type.can_make_group {
+            let new_group = Arc::new(ConfigGroup::new(name, item_type.clone()));
+            group.children.lock().unwrap().insert(name.to_string(), ConfigChild::Group(new_group));
+        } else if item_type.can_make_item {
+            let new_item = Arc::new(ConfigItem::new(name, item_type.clone()));
+            group.children.lock().unwrap().insert(name.to_string(), ConfigChild::Item(new_item));
+        } else {
+            return Err("eperm");
+        }
+        Ok(())
+    }
+
+    /// 在指定路径下 rmdir
+    pub fn rmdir(&self, path: &str, name: &str) -> Result<(), &'static str> {
+        let group = self.resolve_group(path)?;
+        let mut children = group.children.lock().unwrap();
+        if children.remove(name).is_some() { Ok(()) } else { Err("enoent") }
+    }
+
+    fn resolve_group(&self, path: &str) -> Result<Arc<ConfigGroup>, &'static str> {
+        match self.lookup(path)? {
+            ConfigLookup::Group(g) => Ok(g),
+            _ => Err("notdir"),
+        }
+    }
+}
+
+/// configFS 查找结果
+#[derive(Clone)]
+pub enum ConfigLookup {
+    Group(Arc<ConfigGroup>),
+    Item(Arc<ConfigItem>),
+    Attr(Arc<ConfigItem>, String),
+}
+
+/// configFS 文件节点：打开一个属性文件后的句柄
+#[derive(Clone)]
+pub struct ConfigNode {
+    pub item: Arc<ConfigItem>,
+    pub attr_name: String,
+    pub offset: usize,
+}
+
+impl ConfigNode {
+    /// 创建新的 config 节点
+    pub fn new(item: Arc<ConfigItem>, attr_name: &str) -> Self {
+        Self { item, attr_name: attr_name.to_string(), offset: 0 }
+    }
+
+    /// 读取属性内容
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, &'static str> {
+        for attr in &self.item.item_type.attrs {
+            if attr.name == self.attr_name {
+                let content = (attr.show)(&self.item);
+                let bytes = content.as_bytes();
+                if self.offset >= bytes.len() { return Ok(0); }
+                let n = min(bytes.len() - self.offset, buf.len());
+                buf[..n].copy_from_slice(&bytes[self.offset..self.offset + n]);
+                self.offset += n;
+                return Ok(n);
+            }
+        }
+        Err("enoent")
+    }
+
+    /// 写入属性内容
+    pub fn write(&mut self, buf: &[u8]) -> Result<usize, &'static str> {
+        let s = std::str::from_utf8(buf).map_err(|_| "utf8")?;
+        for attr in &self.item.item_type.attrs {
+            if attr.name == self.attr_name {
+                (attr.store)(&self.item, s.trim())?;
+                return Ok(buf.len());
+            }
+        }
+        Err("enoent")
+    }
+
+    /// poll 状态：config 属性总是可读/可写
+    pub fn poll(&self) -> (bool, bool, bool) { (true, true, false) }
+}
+
 // ==================== 文件描述符选项 ====================
 
 /// 文件打开选项，对应 Linux open() 的 flags
@@ -382,9 +603,10 @@ impl PipeNode {
 /// 每个文件描述符都存储为 FLike，读写时通过 match 分发到对应实现
 #[derive(Clone)]
 pub enum FLike {
-    File(FHandle),    // 普通文件
-    Pipe(PipeNode),   // 管道（pipe() 创建）
-    Ep(EpInst),       // epoll 实例（epoll_create() 创建）
+    File(FHandle),      // 普通文件
+    Pipe(PipeNode),     // 管道（pipe() 创建）
+    Ep(EpInst),         // epoll 实例（epoll_create() 创建）
+    Config(ConfigNode), // configFS 属性文件
 }
 
 impl FLike {
@@ -414,6 +636,9 @@ impl FLike {
                     new_ctl: e.new_ctl.clone(),
                 };
                 FLike::Ep(cloned)
+            }
+            FLike::Config(c) => {
+                FLike::Config(c.clone())
             }
         }
     }
@@ -458,6 +683,10 @@ impl FLike {
                 Ok(take)
             }
             FLike::Ep(_) => Err("enosys"),  // epoll 实例不可读
+            FLike::Config(c) => {
+                let mut node = c.clone();
+                node.read(buf)
+            }
         }
     }
 
@@ -504,6 +733,10 @@ impl FLike {
                 Ok(written)
             }
             FLike::Ep(_) => Err("enosys"),  // epoll 实例不可写
+            FLike::Config(c) => {
+                let mut node = c.clone();
+                node.write(buf)
+            }
         }
     }
 
@@ -524,6 +757,7 @@ impl FLike {
                 }
             }
             FLike::Ep(_) => Err("enosys"),
+            FLike::Config(_) => Err("enotty"),
         }
     }
 
@@ -538,7 +772,7 @@ impl FLike {
                 drop(d);
                 f.mmap(start, end, off)
             }
-            _ => Err("enosys"),  // 管道和 epoll 不支持 mmap
+            _ => Err("enosys"),  // 管道、epoll 和 configFS 不支持 mmap
         }
     }
 
@@ -573,6 +807,7 @@ impl FLike {
                 // epoll 可读条件：就绪队列非空
                 (has_ready, false, false)
             }
+            FLike::Config(c) => c.poll(),
         }
     }
 }
@@ -583,6 +818,7 @@ impl fmt::Debug for FLike {
             FLike::File(h) => write!(f, "F({:?})", h),
             FLike::Pipe(_) => write!(f, "P"),
             FLike::Ep(_) => write!(f, "E"),
+            FLike::Config(_) => write!(f, "C"),
         }
     }
 }
