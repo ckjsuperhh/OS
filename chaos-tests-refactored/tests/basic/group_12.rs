@@ -28,9 +28,8 @@ fn configfs_demo_mkdir_read_write() {
     let n = node.read(&mut buf).unwrap();
     assert_eq!(&buf[..n], b"0");
 
-    // 写入新值 42 后回读，验证 store/show 回调正确更新 data
+    // 写入新值 42 后回读，write 内部已重置 offset，无需手动重置
     node.write(b"42").unwrap();
-    node.offset = 0; // 重置读取偏移，从头读取完整内容
     let n = node.read(&mut buf).unwrap();
     assert_eq!(&buf[..n], b"42");
 }
