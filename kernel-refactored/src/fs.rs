@@ -169,7 +169,11 @@ impl ConfigFS {
                     Some(ConfigChild::Group(g)) => Some(ConfigChild::Group(g.clone())),
                     Some(ConfigChild::Item(item)) => {
                         if i + 1 < parts.len() {
-                            // item 后面还有一段，必须是属性名
+                            // item 后面还有一段，必须是属性名，且必须是最后一段
+                            // 若 i+2 < parts.len()，说明属性名后还有多余路径段（如 .../attr/extra），属非法路径
+                            if i + 2 < parts.len() {
+                                return Err("enoent"); // 属性名后不允许再有子路径
+                            }
                             let attr_name = parts[i + 1];
                             for attr in &item.item_type.attrs {
                                 if attr.name == attr_name {
