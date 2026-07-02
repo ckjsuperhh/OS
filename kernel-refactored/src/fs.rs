@@ -265,7 +265,7 @@ impl ConfigNode {
             if attr.name == self.attr_name {
                 let content = (attr.show)(&self.item); // 调用 show 回调生成当前值
                 let bytes = content.as_bytes();
-                if self.offset >= bytes.len() { return Ok(0); } // EOF
+                if self.offset >= bytes.len() { return Ok(0); } // offset==len 正常 EOF；offset>len 说明两次 read 之间值被缩短，防御性返回 EOF
                 let n = min(bytes.len() - self.offset, buf.len());
                 buf[..n].copy_from_slice(&bytes[self.offset..self.offset + n]);
                 self.offset += n;
