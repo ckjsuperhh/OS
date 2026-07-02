@@ -28,9 +28,10 @@ fn configfs_demo_mkdir_read_write() {
     let n = node.read(&mut buf).unwrap();
     assert_eq!(&buf[..n], b"0");
 
-    // 写入新值 42 后回读，write 内部已重置 offset，无需手动重置
+    // 写入新值 42 后回读；write 不重置 offset（与 FHandle 语义一致），需重建 ConfigNode 模拟 re-open
     node.write(b"42").unwrap();
-    let n = node.read(&mut buf).unwrap();
+    let mut node2 = ConfigNode::new(node.item.clone(), &node.attr_name);
+    let n = node2.read(&mut buf).unwrap();
     assert_eq!(&buf[..n], b"42");
 }
 

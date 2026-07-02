@@ -258,35 +258,32 @@ impl ConfigNode {
     }
 
     /// 读取属性内容（从 offset 开始，最多填满 buf）
-    /// 调用 item_type 中该属性的 show 回调生成字符串，然后按 offset 切片写入 buf。
-    /// 返回实际读取字节数；offset 到达字符串末尾时返回 0（EOF）。
-    /// offset > bytes.len() 说明两次 read 之间值被缩短（show 返回更短的字符串），
-    /// 同样视为 EOF，安全返回 0 而不越界。
+    /// 调用 show 回调生成当前值字符串，按 offset 切片写入 buf，并推进 offset。
+    /// 返回 0 表示 EOF；offset > bytes.len() 属防御（两次 read 之间值被缩短），同样返回 0。
+    /// 若要重新从头读，需重新 open（新建 ConfigNode），与 FHandle 语义一致。
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, &'static str> {
         for attr in &self.item.item_type.attrs {
             if attr.name == self.attr_name {
-                let content = (attr.show)(&self.item); // 调用 show 回调生成当前值
+                let content = (attr.show)(&self.item);
                 let bytes = content.as_bytes();
-                if self.offset >= bytes.len() { return Ok(0); } // offset==len 正常 EOF；offset>len 值被缩短，防御性返回 EOF
+                if self.offset >= bytes.len() { return Ok(0); }
                 let n = min(bytes.len() - self.offset, buf.len());
                 buf[..n].copy_from_slice(&bytes[self.offset..self.offset + n]);
                 self.offset += n;
                 return Ok(n);
             }
         }
-        Err("enoent") // 属性不存在（理论上不会到达，因为 ConfigNode 由 lookup 保证合法）
+        Err("enoent")
     }
 
-    /// 写入属性内容（将整个 buf 作为一次完整写入）
+    /// 写入属性内容（将整个 buf 作为一次完整写入，不修改 offset）
     /// 先将字节流解析为 UTF-8 字符串，去除首尾空白后传入 store 回调。
-    /// store 回调负责格式校验（如整数范围检查）并更新 item.data。
-    /// 写入成功后重置 offset 为 0，使下次 read 从新值的开头开始。
+    /// store 回调负责格式校验并更新 item.data。offset 不变，与 FHandle::write 语义一致。
     pub fn write(&mut self, buf: &[u8]) -> Result<usize, &'static str> {
         let s = std::str::from_utf8(buf).map_err(|_| "utf8")?;
         for attr in &self.item.item_type.attrs {
             if attr.name == self.attr_name {
-                (attr.store)(&self.item, s.trim())?; // 调用 store 回调更新 item 状态
-                self.offset = 0; // 重置读取游标，使下次 read 从新值头部开始
+                (attr.store)(&self.item, s.trim())?;
                 return Ok(buf.len());
             }
         }
