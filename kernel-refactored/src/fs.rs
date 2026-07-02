@@ -214,7 +214,9 @@ impl ConfigFS {
     }
 
     /// 在指定路径的 group 下删除子对象（用户态 rmdir 触发）
-    /// 删除后对象的 Arc 引用计数归零即释放；若有 FLike::Config 持有则延迟释放。
+    /// 将 name 从 children map 中移除，Arc 引用计数减一。
+    /// 若此时无其他持有者则立即释放；若有打开的 ConfigNode 持有同一 Arc，
+    /// 则由 Arc 的引用计数自然管理，ConfigNode drop 时才真正释放——此处无需额外处理。
     pub fn rmdir(&self, path: &str, name: &str) -> Result<(), &'static str> {
         let group = self.resolve_group(path)?;
         let mut children = group.children.lock().unwrap();
