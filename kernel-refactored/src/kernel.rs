@@ -1426,28 +1426,37 @@ impl Kernel {
 }
 
 /// 创建 configFS demo 子系统：counter [BUG-20]
-/// 用户可在 /config/demo 下 mkdir 创建计数器 item，读写 value 属性
+///
+/// 注册后用户可在 /config/demo 下 mkdir 创建计数器 item：
+///   mkdir /config/demo/counter0
+/// 每个 item 暴露一个 `value` 属性文件（权限 0o644）：
+///   cat /config/demo/counter0/value    → 读取当前值（默认 "0"）
+///   echo 42 > /config/demo/counter0/value → 更新值（必须是合法 i64 整数）
+/// rmdir /config/demo/counter0 可销毁 item，打开的 ConfigNode 会通过 Arc 延迟释放。
 pub fn demo_config_subsystem() -> ConfigSubsystem {
+    // show 回调：从 item.data 读取 "value" 键，未设置时默认返回 "0"
     fn demo_show(item: &ConfigItem) -> String {
         item.data.lock().unwrap()
             .get("value").cloned().unwrap_or_else(|| "0".to_string())
     }
+    // store 回调：先校验输入是合法 i64，再写入 item.data["value"]
     fn demo_store(item: &ConfigItem, s: &str) -> Result<(), &'static str> {
-        s.parse::<i64>().map_err(|_| "einval")?;
+        s.parse::<i64>().map_err(|_| "einval")?; // 拒绝非整数输入
         item.data.lock().unwrap().insert("value".to_string(), s.to_string());
         Ok(())
     }
+    // counter 类型：每个 item 有一个 value 属性，不支持嵌套 group 和符号链接
     let counter_type = Arc::new(ConfigItemType {
         name: "counter".to_string(),
         attrs: vec![ConfigAttr {
             name: "value".to_string(),
-            mode: 0o644,
+            mode: 0o644,      // 用户可读写
             show: demo_show,
             store: demo_store,
         }],
-        can_make_item: true,
-        can_make_group: false,
-        can_link: false,
+        can_make_item: true,   // 允许用户 mkdir 创建计数器 item
+        can_make_group: false, // 不允许嵌套 group
+        can_link: false,       // 不支持符号链接
     });
     ConfigSubsystem::new("demo", counter_type)
 }

@@ -26,33 +26,52 @@ use crate::channel::CircBuf;
 use crate::util::CLK;
 
 // ==================== configFS 伪文件系统 ==================== [BUG-20]
+// configFS 是 Linux 风格的用户态驱动伪文件系统：
+//   - 对象生命周期由用户态控制：mkdir 创建、rmdir 销毁，区别于 procfs/sysfs 的内核驱动。
+//   - 属性内容由回调动态生成/接受，适合内核子系统的运行时配置（如内核模块参数、驱动配置）。
+//   - 挂载于 /config，子系统注册后在其子目录下暴露对象类型。
+//
+// 目录树结构：
+//   /config/
+//     <subsystem>/          ← ConfigSubsystem（内核注册）
+//       <item 或 group>/    ← ConfigChild（用户 mkdir 创建）
+//         <attr>            ← ConfigAttr（read=show回调, write=store回调）
 
-/// configFS 属性描述：名称、权限、读写回调
+/// configFS 属性描述符
+/// 一个属性对应 item 目录下的一个普通文件（如 /config/demo/counter0/value）。
+/// - `mode`：权限位（0o644 可读写，0o444 只读）
+/// - `show`：读取时调用，将 item 的内部状态格式化为字符串（类比 sysfs show）
+/// - `store`：写入时调用，将字符串解析后更新 item 的内部状态（类比 sysfs store）
 pub struct ConfigAttr {
-    pub name: String,
-    pub mode: u16,
-    pub show: fn(&ConfigItem) -> String,
-    pub store: fn(&ConfigItem, &str) -> Result<(), &'static str>,
+    pub name: String,                                       // 属性文件名（如 "value"）
+    pub mode: u16,                                          // 权限位（0o644 / 0o444）
+    pub show: fn(&ConfigItem) -> String,                    // 读取回调：item → 字符串
+    pub store: fn(&ConfigItem, &str) -> Result<(), &'static str>, // 写入回调：字符串 → item
 }
 
-/// configFS 项目类型：定义一类 item 有哪些属性和创建能力
+/// configFS 项目类型：一类可创建对象的模板
+/// 类比 Linux `config_item_type`：决定该组下可以 mkdir 什么类型的孩子，以及孩子有哪些属性。
+/// - `can_make_item`：mkdir 时创建 ConfigItem（叶节点，有属性，无子对象）
+/// - `can_make_group`：mkdir 时创建 ConfigGroup（可再嵌套子对象）
+/// - `can_link`：是否允许符号链接（本实现暂不启用）
 pub struct ConfigItemType {
-    pub name: String,
-    pub attrs: Vec<ConfigAttr>,
-    pub can_make_item: bool,
-    pub can_make_group: bool,
-    pub can_link: bool,
+    pub name: String,           // 类型名（如 "counter"）
+    pub attrs: Vec<ConfigAttr>, // 该类型暴露的属性列表
+    pub can_make_item: bool,    // 允许在此组下 mkdir 创建叶节点
+    pub can_make_group: bool,   // 允许在此组下 mkdir 创建嵌套组
+    pub can_link: bool,         // 允许在此组下建立符号链接（暂未实现）
 }
 
-/// configFS 配置项：对应一个目录
+/// configFS 配置项（叶节点）：对应用户 mkdir 创建的目录
+/// 包含 item_type 定义的所有属性，数据存在 `data` 键值表中，由 show/store 回调读写。
 pub struct ConfigItem {
-    pub name: String,
-    pub item_type: Arc<ConfigItemType>,
-    pub data: Mutex<BTreeMap<String, String>>,
+    pub name: String,                           // item 目录名（如 "counter0"）
+    pub item_type: Arc<ConfigItemType>,         // 所属类型（决定有哪些属性）
+    pub data: Mutex<BTreeMap<String, String>>,  // 运行时数据：属性名 → 当前值
 }
 
 impl ConfigItem {
-    /// 创建新的配置项
+    /// 创建新 item，data 初始为空（属性由 show 回调提供默认值）
     pub fn new(name: &str, item_type: Arc<ConfigItemType>) -> Self {
         Self {
             name: name.to_string(),
@@ -62,21 +81,23 @@ impl ConfigItem {
     }
 }
 
-/// configFS 子节点：item 或 group
+/// configFS 子节点：item（叶节点）或 group（中间节点）
+/// mkdir 时根据 item_type.can_make_item / can_make_group 决定创建哪种类型。
 #[derive(Clone)]
 pub enum ConfigChild {
-    Item(Arc<ConfigItem>),
-    Group(Arc<ConfigGroup>),
+    Item(Arc<ConfigItem>),   // 叶节点：有属性文件，不能继续 mkdir
+    Group(Arc<ConfigGroup>), // 中间节点：可以继续 mkdir 创建子对象
 }
 
-/// configFS 配置组：可以包含子 item / 子 group 的目录
+/// configFS 配置组（中间节点）：可以包含子 item / 子 group 的目录
+/// 内部维护一把 Mutex 保护 children 表，支持并发 mkdir/rmdir。
 pub struct ConfigGroup {
-    pub item: ConfigItem,
-    pub children: Mutex<BTreeMap<String, ConfigChild>>,
+    pub item: ConfigItem,                               // 本组自身作为一个 item（有名称和类型）
+    pub children: Mutex<BTreeMap<String, ConfigChild>>, // 子对象表：名称 → 子节点
 }
 
 impl ConfigGroup {
-    /// 创建新组
+    /// 创建新的配置组，children 初始为空
     pub fn new(name: &str, item_type: Arc<ConfigItemType>) -> Self {
         Self {
             item: ConfigItem::new(name, item_type),
@@ -85,14 +106,15 @@ impl ConfigGroup {
     }
 }
 
-/// configFS 子系统：顶层注册单元
+/// configFS 子系统：内核模块向 /config 下注册的顶层目录
+/// 一个子系统对应 /config/<name>，其 root group 决定了用户可以在其下创建什么对象。
 pub struct ConfigSubsystem {
-    pub name: String,
-    pub root: Arc<ConfigGroup>,
+    pub name: String,           // 子系统名，挂载为 /config/<name>
+    pub root: Arc<ConfigGroup>, // 根 group，mkdir 时从这里创建子对象
 }
 
 impl ConfigSubsystem {
-    /// 创建新子系统
+    /// 创建新子系统，root group 使用 root_type 定义的类型
     pub fn new(name: &str, root_type: Arc<ConfigItemType>) -> Self {
         Self {
             name: name.to_string(),
@@ -101,53 +123,62 @@ impl ConfigSubsystem {
     }
 }
 
-/// configFS 全局管理器
+/// configFS 全局管理器：持有所有已注册的子系统
+/// 挂载于 Kernel.configfs，由 proc_init() 初始化并注册子系统。
 pub struct ConfigFS {
-    pub subsystems: Mutex<BTreeMap<String, Arc<ConfigSubsystem>>>,
+    pub subsystems: Mutex<BTreeMap<String, Arc<ConfigSubsystem>>>, // 子系统表：名称 → 子系统
 }
 
 impl ConfigFS {
-    /// 创建空的 configFS
+    /// 创建空的 configFS 实例（无任何子系统）
     pub fn new() -> Self {
         Self { subsystems: Mutex::new(BTreeMap::new()) }
     }
 
-    /// 注册子系统
+    /// 注册一个内核子系统，使其出现在 /config/<name> 下
     pub fn register_subsystem(&self, subsys: ConfigSubsystem) {
         let mut s = self.subsystems.lock().unwrap();
         s.insert(subsys.name.clone(), Arc::new(subsys));
     }
 
-    /// 解析路径，返回找到的属性或目录节点
-    /// 路径格式: subsys/[group/...]item/attr
+    /// 解析路径，返回找到的属性、item 或 group 节点
+    /// 路径格式：`subsys[/group...]item/attr` 或 `subsys[/group...]`
+    ///
+    /// 实现策略：按 '/' 切分路径，第一段定位子系统，
+    /// 后续段沿 group.children 树往下走；遇到 item 后看下一段是否是已知属性。
+    /// 借用规则：每次在持有 children 锁的同时 clone 出目标 Arc，出锁后再切换 current，
+    /// 避免跨循环持有 MutexGuard 引起借用冲突。
     pub fn lookup(&self, path: &str) -> Result<ConfigLookup, &'static str> {
         let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
         if parts.is_empty() { return Err("enoent"); }
         let subsys_name = parts[0];
+        // 在锁作用域内取出 Arc，出锁后再使用，避免 subsystems 锁跨越整个遍历
         let subsys = {
             let s = self.subsystems.lock().unwrap();
             s.get(subsys_name).cloned()
         };
         let subsys = subsys.ok_or("enoent")?;
-        let mut current = subsys.root.clone();
+        let mut current = subsys.root.clone(); // 从子系统根 group 开始遍历
         let mut i = 1;
         while i < parts.len() {
             let name = parts[i];
+            // 在锁内 clone 出下一跳节点，立即出锁，避免借用冲突
             let next = {
                 let children = current.children.lock().unwrap();
                 match children.get(name) {
                     Some(ConfigChild::Group(g)) => Some(ConfigChild::Group(g.clone())),
                     Some(ConfigChild::Item(item)) => {
                         if i + 1 < parts.len() {
+                            // item 后面还有一段，必须是属性名
                             let attr_name = parts[i + 1];
                             for attr in &item.item_type.attrs {
                                 if attr.name == attr_name {
                                     return Ok(ConfigLookup::Attr(item.clone(), attr_name.to_string()));
                                 }
                             }
-                            return Err("enoent");
+                            return Err("enoent"); // 属性不存在
                         } else {
-                            return Ok(ConfigLookup::Item(item.clone()));
+                            return Ok(ConfigLookup::Item(item.clone())); // 路径终止于 item
                         }
                     }
                     None => return Err("enoent"),
@@ -158,10 +189,11 @@ impl ConfigFS {
                 _ => return Err("enoent"),
             }
         }
-        Ok(ConfigLookup::Group(current))
+        Ok(ConfigLookup::Group(current)) // 路径终止于 group
     }
 
-    /// 在指定路径下 mkdir（创建子 item 或子 group）
+    /// 在指定路径的 group 下创建新的子对象（用户态 mkdir 触发）
+    /// 根据 item_type 决定创建 ConfigItem（叶）还是 ConfigGroup（中间节点）。
     pub fn mkdir(&self, path: &str, name: &str) -> Result<(), &'static str> {
         let group = self.resolve_group(path)?;
         let item_type = &group.item.item_type;
@@ -172,18 +204,20 @@ impl ConfigFS {
             let new_item = Arc::new(ConfigItem::new(name, item_type.clone()));
             group.children.lock().unwrap().insert(name.to_string(), ConfigChild::Item(new_item));
         } else {
-            return Err("eperm");
+            return Err("eperm"); // 该 group 的类型不允许创建子对象
         }
         Ok(())
     }
 
-    /// 在指定路径下 rmdir
+    /// 在指定路径的 group 下删除子对象（用户态 rmdir 触发）
+    /// 删除后对象的 Arc 引用计数归零即释放；若有 FLike::Config 持有则延迟释放。
     pub fn rmdir(&self, path: &str, name: &str) -> Result<(), &'static str> {
         let group = self.resolve_group(path)?;
         let mut children = group.children.lock().unwrap();
         if children.remove(name).is_some() { Ok(()) } else { Err("enoent") }
     }
 
+    /// 内部辅助：将路径解析为 group；若路径指向非 group 节点则返回 notdir
     fn resolve_group(&self, path: &str) -> Result<Arc<ConfigGroup>, &'static str> {
         match self.lookup(path)? {
             ConfigLookup::Group(g) => Ok(g),
@@ -192,57 +226,64 @@ impl ConfigFS {
     }
 }
 
-/// configFS 查找结果
+/// configFS 路径查找结果
+/// SYS_OPEN 和内部 API 用此枚举区分路径终止于哪种节点。
 #[derive(Clone)]
 pub enum ConfigLookup {
-    Group(Arc<ConfigGroup>),
-    Item(Arc<ConfigItem>),
-    Attr(Arc<ConfigItem>, String),
+    Group(Arc<ConfigGroup>),         // 路径终止于目录（group）
+    Item(Arc<ConfigItem>),           // 路径终止于对象目录（item）
+    Attr(Arc<ConfigItem>, String),   // 路径终止于属性文件（item + 属性名）
 }
 
-/// configFS 文件节点：打开一个属性文件后的句柄
+/// configFS 属性文件句柄：打开一个属性文件后产生的读写游标
+/// 持有对 item 的 Arc 引用（rmdir 后 item 依然有效，直到此句柄关闭）。
+/// `offset` 记录下一次 read 从字符串的哪个字节开始，实现分段读取。
 #[derive(Clone)]
 pub struct ConfigNode {
-    pub item: Arc<ConfigItem>,
-    pub attr_name: String,
-    pub offset: usize,
+    pub item: Arc<ConfigItem>,  // 所属 item（跨 rmdir 存活，Arc 保证）
+    pub attr_name: String,      // 对应的属性名
+    pub offset: usize,          // 读取游标（write 后需调用方重置为 0 才能重读）
 }
 
 impl ConfigNode {
-    /// 创建新的 config 节点
+    /// 创建新的属性文件句柄，读取游标从 0 开始
     pub fn new(item: Arc<ConfigItem>, attr_name: &str) -> Self {
         Self { item, attr_name: attr_name.to_string(), offset: 0 }
     }
 
-    /// 读取属性内容
+    /// 读取属性内容（从 offset 开始，最多填满 buf）
+    /// 调用 item_type 中该属性的 show 回调生成字符串，然后按 offset 切片写入 buf。
+    /// 返回实际读取字节数；offset 到达字符串末尾时返回 0（EOF）。
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, &'static str> {
         for attr in &self.item.item_type.attrs {
             if attr.name == self.attr_name {
-                let content = (attr.show)(&self.item);
+                let content = (attr.show)(&self.item); // 调用 show 回调生成当前值
                 let bytes = content.as_bytes();
-                if self.offset >= bytes.len() { return Ok(0); }
+                if self.offset >= bytes.len() { return Ok(0); } // EOF
                 let n = min(bytes.len() - self.offset, buf.len());
                 buf[..n].copy_from_slice(&bytes[self.offset..self.offset + n]);
                 self.offset += n;
                 return Ok(n);
             }
         }
-        Err("enoent")
+        Err("enoent") // 属性不存在（理论上不会到达，因为 ConfigNode 由 lookup 保证合法）
     }
 
-    /// 写入属性内容
+    /// 写入属性内容（将整个 buf 作为一次完整写入）
+    /// 先将字节流解析为 UTF-8 字符串，去除首尾空白后传入 store 回调。
+    /// store 回调负责格式校验（如整数范围检查）并更新 item.data。
     pub fn write(&mut self, buf: &[u8]) -> Result<usize, &'static str> {
         let s = std::str::from_utf8(buf).map_err(|_| "utf8")?;
         for attr in &self.item.item_type.attrs {
             if attr.name == self.attr_name {
-                (attr.store)(&self.item, s.trim())?;
+                (attr.store)(&self.item, s.trim())?; // 调用 store 回调更新 item 状态
                 return Ok(buf.len());
             }
         }
         Err("enoent")
     }
 
-    /// poll 状态：config 属性总是可读/可写
+    /// poll 状态：config 属性文件总是可读可写，不会阻塞
     pub fn poll(&self) -> (bool, bool, bool) { (true, true, false) }
 }
 
